@@ -81,7 +81,9 @@ Three interfaces exist from the first week, even when each has one implementatio
    | One-line edit (`add(2, 3)` ↔ `add(2, 4)`), `cargo build` | 0.127 s | 0.126–0.134 s |
    | No-op `cargo build` | 0.037 s | 0.035–0.038 s |
 
-   For scale, not comparison: Athrad’s back half on the same program (hand-written IR → verify → Cranelift → object → `cc`) is 74 ms median, of which verify and codegen are 0.26 ms. The rest is the system linker. `cargo run --release -p oracle --example time_athrad`. Nothing has been optimized.
+   For scale, not comparison: Athrad’s back half on the same program (hand-written IR → verify → Cranelift → object → link) is 29 ms median: verify and codegen 0.23 ms, writing the object 0.11 ms, the link 28 ms. `cargo run --release -p oracle --example time_athrad` prints each phase.
+
+   **Linker profile** (macOS, same machine). It started at 75 ms because `athrad::build` found the linker on every build: `link::HostCc::new` runs the `cc` crate’s compiler probes (48 ms warm, 70 ms in a fresh process) only to return `cc`. The caller now finds it once and passes it in. The 28 ms link through `cc` is about 11 ms for the `clang` driver, 8 ms for `ld` to start, and 10 ms of linking; calling `ld` directly takes 18 ms but means repeating the driver’s work (SDK, platform version, and on Linux the crt objects and dynamic loader) on three hosts, and `rustc` links through `cc` too. `rust-lld` from rustup (LLD 22.1.8) cannot link on macOS 27: it rejects the `arm64e.x1` architecture in the SDK’s `libSystem.tbd`.
 4. Read, in this order, only enough to copy the seams: Cranelift’s object-emission API, the `object` crate’s write path for the host format, and the MIR-to-Cranelift lowering in `rustc_codegen_cranelift`. Blaze’s v2 plan is a map of later lanes, not the first month’s work.
 
 ## Out of scope until a milestone names it
@@ -98,7 +100,7 @@ Milestone 0 is done on all three hosts. The oracle passes in CI on Ubuntu, macOS
 
 * `ir`: types (`i8`, `i32`, `i64`), constants, wrapping arithmetic, compares, extends and truncates, calls by name, jumps, branches, returns. SSA with block parameters. `ir::verify` checks types, dominance, and terminators; codegen assumes verified IR.
 * `codegen`: IR → Cranelift 0.137 → `object::write::Object` for the host. `opt_level=none`, PIC except on Windows.
-* `link`: the `ObjectFormat` seam (ELF, Mach-O, COFF) and the `Linker` seam with one implementation, `HostCc`: `cc` on Unix, `link.exe` found by the `cc` crate on MSVC (`msvcrt`, `vcruntime`, `ucrt`, `kernel32`).
+* `link`: the `ObjectFormat` seam (ELF, Mach-O, COFF) and the `Linker` seam with one implementation, `HostCc`, found once by the caller and passed to `athrad::build`: `cc` on Unix, `link.exe` found by the `cc` crate on MSVC (`msvcrt`, `vcruntime`, `ucrt`, `kernel32`).
 * `oracle`: builds each program in `oracle::programs::ALL` with `rustc --edition 2024` (debug) and with Athrad, runs both, and compares stdout, stderr, and exit status. `cargo test` runs it. One test checks that the oracle catches a wrong answer.
 * `athrad` (a fifth crate, not in the plan above): the pipeline that joins the four (`athrad::build`), the runtime written in IR (`athrad::rt`: a C `main` that calls the program’s main, as `lang_start` does, and `println!` of an `i64` through `putchar`), and the `Watcher` trait with no implementation yet. It becomes the `athrad` command when there is Rust to take in, at milestone 1.
 

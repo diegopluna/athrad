@@ -5,6 +5,9 @@
 //! * [`ObjectFormat`]: ELF, Mach-O, or COFF, picked from the host.
 //! * [`Linker`]: [`HostCc`], the host C toolchain. `lld` can join it later if
 //!   a profile says the system linker is the slow part.
+//!
+//! Finding the host toolchain ([`HostCc::new`]) runs the `cc` crate's
+//! compiler probes and takes longer than a link, so find it once and reuse it.
 
 use std::fmt;
 use std::path::{Path, PathBuf};

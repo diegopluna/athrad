@@ -7,6 +7,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 
@@ -89,9 +90,20 @@ pub fn build_with_rustc(program: &Program, dir: &Path) -> Result<PathBuf> {
     Ok(exe)
 }
 
+/// The host linker, found once per process and shared by every build.
+pub fn linker() -> Result<&'static link::HostCc> {
+    static LINKER: OnceLock<link::HostCc> = OnceLock::new();
+    if let Some(l) = LINKER.get() {
+        return Ok(l);
+    }
+    let found = link::HostCc::new()?;
+    Ok(LINKER.get_or_init(|| found))
+}
+
 pub fn build_with_athrad(program: &Program, dir: &Path) -> Result<PathBuf> {
     let exe = dir.join(link::executable_name(program.name));
-    athrad::build(&(program.ir)(), dir, &exe).with_context(|| format!("athrad failed on `{}`", program.name))?;
+    athrad::build(&(program.ir)(), linker()?, dir, &exe)
+        .with_context(|| format!("athrad failed on `{}`", program.name))?;
     Ok(exe)
 }
 
