@@ -121,6 +121,8 @@ fn host_isa() -> Result<OwnedTargetIsa> {
     let mut flags = settings::builder();
     flags.set("opt_level", "none")?;
     flags.set("preserve_frame_pointers", "true")?;
+    // Pass i128 the way LLVM does, which is how rustc's code expects it.
+    flags.set("enable_llvm_abi_extensions", "true")?;
     // ELF and Mach-O executables are position independent by default. On
     // COFF, link.exe makes import thunks and base relocations itself.
     let pic = !cfg!(windows);

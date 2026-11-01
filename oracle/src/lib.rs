@@ -163,7 +163,13 @@ pub fn build_with_athrad(name: &str, source: &Path, dir: &Path) -> Result<PathBu
 }
 
 fn run(exe: &Path) -> Result<Run> {
-    let out = Command::new(exe).output().with_context(|| format!("running {}", exe.display()))?;
+    // A backtrace depends on debug info, which Athrad does not write yet,
+    // and is not part of what a program does. Run both without one.
+    let out = Command::new(exe)
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("RUST_LIB_BACKTRACE")
+        .output()
+        .with_context(|| format!("running {}", exe.display()))?;
     let mut run = Run::from(out);
     run.stderr = mask_thread_ids(&run.stderr);
     Ok(run)
