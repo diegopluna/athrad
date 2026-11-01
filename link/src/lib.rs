@@ -7,7 +7,7 @@
 //!   a profile says the system linker is the slow part.
 //!
 //! On MSVC, finding the host toolchain ([`HostCc::new`]) runs the `cc` crate's
-//! search for `link.exe`, which takes longer than a link, so find it once.
+//! search for `link.exe` and its environment, so find it once and reuse it.
 
 use std::ffi::OsString;
 use std::fmt;
