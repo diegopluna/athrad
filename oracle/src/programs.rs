@@ -6,7 +6,7 @@ use ir::{FunctionBuilder, Linkage, Module, Signature, Type};
 
 use crate::Program;
 
-pub const ALL: &[Program] = &[ADD];
+pub const ALL: &[Program] = &[ADD, PRINT_EDGES];
 
 /// Milestone 0: a function that adds two numbers, and a print of the result.
 pub const ADD: Program = Program { name: "add", source: include_str!("../programs/add.rs"), ir: add };
@@ -34,5 +34,22 @@ fn add() -> Module {
     b.ret(None);
     m.push(b.finish());
 
+    m
+}
+
+/// The runtime's integer printing at its edges: zero, one digit, a sign, and
+/// both ends of `i64`.
+pub const PRINT_EDGES: Program =
+    Program { name: "print_edges", source: include_str!("../programs/print_edges.rs"), ir: print_edges };
+
+fn print_edges() -> Module {
+    let mut m = Module::new();
+    let mut b = FunctionBuilder::new(rt::USER_MAIN, Linkage::Local, Signature::default());
+    for n in [0, 7, -42, 1_000_000, i64::MAX, i64::MIN] {
+        let v = b.iconst(Type::I64, n);
+        b.call(rt::PRINTLN_I64, &[v], None);
+    }
+    b.ret(None);
+    m.push(b.finish());
     m
 }
