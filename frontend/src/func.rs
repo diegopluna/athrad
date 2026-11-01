@@ -118,8 +118,15 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     fn lower_body(&mut self) -> Result<()> {
         let mir = self.mir;
+        // Blocks a constant `switchInt` rules out once types are known are
+        // dead, and may name items the mono collector never saw, as `rustc`
+        // skips them. They become traps.
+        let reachable = rustc_middle::mir::traversal::mono_reachable_as_bitset(mir, self.tcx, self.instance);
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
-            if data.is_cleanup {
+            if !reachable.contains(bb) {
+                let (id, _) = self.b.block(&[]);
+                self.blocks.push(Some(id));
+            } else if data.is_cleanup {
                 self.check_cleanup(bb)?;
                 self.blocks.push(None);
             } else {
@@ -131,6 +138,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         for (bb, data) in mir.basic_blocks.iter_enumerated() {
             let Some(id) = self.blocks[bb] else { continue };
             self.b.switch_to(id);
+            if !reachable.contains(bb) {
+                self.b.trap();
+                continue;
+            }
             for stmt in &data.statements {
                 self.statement(stmt).map_err(|e| self.at(e, stmt.source_info.span))?;
             }
@@ -155,10 +166,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 ty::EarlyBinder::bind(tcx, ty),
             )
         };
-        self.m.skippable.cleanup_block(tcx, mir, bb, mono).map_err(|why| {
-            let span = self.span_str(mir.basic_blocks[bb].terminator().source_info.span);
-            unsupported(format!("{why} ({span})"))
-        })
+        let span =
+            || tcx.sess.source_map().span_to_diagnostic_string(mir.basic_blocks[bb].terminator().source_info.span);
+        self.m
+            .skippable
+            .cleanup_block(tcx, mir, bb, mono, span)
+            .map_err(|why| unsupported(format!("{why} ({})", span())))
     }
 
     fn block(&self, bb: BasicBlock) -> BlockId {
@@ -344,11 +357,23 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 }
                 ProjectionElem::Field(field, _) => {
                     let layout = p.layout.field(&self.cx, field.as_usize());
-                    if layout.is_unsized() {
-                        return Err(unsupported("fields of unsized structs"));
+                    let offset = off(p.layout.fields.offset(field.as_usize()));
+                    if !layout.is_unsized() {
+                        PlaceRef { addr: self.b.offset(p.addr, offset), meta: None, layout }
+                    } else {
+                        // The unsized tail keeps the metadata. Its offset is
+                        // static unless its alignment is known only at run
+                        // time, as a trait object's is.
+                        let addr = if let ty::Dynamic(..) = self.struct_tail(layout.ty).kind() {
+                            let (_, align) = self.size_align_of(layout, p.meta)?;
+                            let o = self.b.iconst(PTR, offset.into());
+                            let o = self.round_up(o, align);
+                            self.b.add(p.addr, o)
+                        } else {
+                            self.b.offset(p.addr, offset)
+                        };
+                        PlaceRef { addr, meta: p.meta, layout }
                     }
-                    let addr = self.b.offset(p.addr, off(p.layout.fields.offset(field.as_usize())));
-                    PlaceRef { addr, meta: None, layout }
                 }
                 ProjectionElem::Index(local) => {
                     let i = self.read(self.locals[local])?;
@@ -369,11 +394,79 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     PlaceRef { layout: p.layout.for_variant(&self.cx, variant), ..p }
                 }
                 ProjectionElem::UnwrapUnsafeBinder(ty) => PlaceRef { layout: self.layout(self.monomorphize(ty)), ..p },
-                ProjectionElem::Subslice { .. } => return Err(unsupported("subslice patterns")),
+                ProjectionElem::Subslice { from, to, from_end } => {
+                    let elem = p.layout.field(&self.cx, 0);
+                    let addr = self.b.offset(p.addr, (from * elem.size.bytes()) as i64);
+                    if from_end {
+                        let layout = p.layout;
+                        // A slice: `[from..len - to]`.
+                        let len = p.meta.ok_or_else(|| unsupported("a slice without a length"))?;
+                        let k = self.b.iconst(PTR, (from + to).into());
+                        let meta = self.b.sub(len, k);
+                        PlaceRef { addr, meta: Some(meta), layout }
+                    } else {
+                        // An array: `[from..to]`.
+                        let layout = self.layout(Ty::new_array(self.tcx, elem.ty, to - from));
+                        PlaceRef { addr, meta: None, layout }
+                    }
+                }
                 ProjectionElem::OpaqueCast(_) => return Err(unsupported("opaque casts")),
             };
         }
         Ok(p)
+    }
+
+    fn struct_tail(&self, ty: Ty<'tcx>) -> Ty<'tcx> {
+        self.tcx.struct_tail_for_codegen(ty, ty::TypingEnv::fully_monomorphized())
+    }
+
+    /// `n` rounded up to a multiple of `align`, a power of two.
+    fn round_up(&mut self, n: Value, align: Value) -> Value {
+        let one = self.b.iconst(PTR, 1);
+        let mask = self.b.sub(align, one);
+        let n = self.b.add(n, mask);
+        let zero = self.b.iconst(PTR, 0);
+        let not_mask = self.b.sub(zero, align);
+        self.b.binary(IBin::And, n, not_mask)
+    }
+
+    /// The size and alignment of a value of `layout` with metadata `meta`,
+    /// as `size_of_val` and `align_of_val` give them.
+    fn size_align_of(&mut self, layout: TyAndLayout<'tcx>, meta: Option<Value>) -> Result<(Value, Value)> {
+        if !layout.is_unsized() {
+            let size = self.b.iconst(PTR, layout.size.bytes().into());
+            let align = self.b.iconst(PTR, layout.align.abi.bytes().into());
+            return Ok((size, align));
+        }
+        let meta = meta.ok_or_else(|| unsupported(format!("`{}` without metadata", layout.ty)))?;
+        match layout.ty.kind() {
+            ty::Slice(_) | ty::Str => {
+                let elem = layout.field(&self.cx, 0);
+                let k = self.b.iconst(PTR, elem.size.bytes().into());
+                let size = self.b.binary(IBin::Mul, meta, k);
+                let align = self.b.iconst(PTR, elem.align.abi.bytes().into());
+                Ok((size, align))
+            }
+            ty::Dynamic(..) => {
+                // A vtable starts with drop_in_place, size, align.
+                let size = self.b.load(PTR, meta, 8);
+                let align = self.b.load(PTR, meta, 16);
+                Ok((size, align))
+            }
+            ty::Adt(..) | ty::Tuple(..) => {
+                let i = layout.fields.count() - 1;
+                let tail = layout.field(&self.cx, i);
+                let (tsize, talign) = self.size_align_of(tail, Some(meta))?;
+                let offset = self.b.iconst(PTR, layout.fields.offset(i).bytes().into());
+                let sized_align = self.b.iconst(PTR, layout.align.abi.bytes().into());
+                let wider = self.b.cmp(Cmp::UGt, sized_align, talign);
+                let align = self.b.select(wider, sized_align, talign);
+                let offset = self.round_up(offset, talign);
+                let unrounded = self.b.add(offset, tsize);
+                Ok((self.round_up(unrounded, align), align))
+            }
+            _ => Err(unsupported(format!("the size of `{}`", layout.ty))),
+        }
     }
 
     fn len_of(&mut self, p: PlaceRef<'tcx>) -> Result<Value> {
@@ -680,6 +773,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                         let m = self.b.iconst(ty, mask);
                         V::Scalar(self.b.binary(IBin::Xor, x, m))
                     }
+                    UnOp::Neg if float_ty(a.layout.ty).is_some() => {
+                        let ft = float_ty(a.layout.ty).expect("a float");
+                        let x = self.load_scalar(a)?;
+                        V::Scalar(self.b.funary(ir::FUnOp::Neg, ft, x))
+                    }
                     UnOp::Neg => {
                         if !matches!(a.layout.ty.kind(), ty::Int(_)) {
                             return Err(unsupported(format!("negating `{}`", a.layout.ty)));
@@ -906,7 +1004,33 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     _ => self.transmute(v, to),
                 }
             }
-            CastKind::FloatToInt | CastKind::FloatToFloat | CastKind::IntToFloat => Err(unsupported("floating point")),
+            CastKind::FloatToInt | CastKind::FloatToFloat | CastKind::IntToFloat => {
+                let v = self.operand(op)?;
+                let x = self.load_scalar(v)?;
+                let from = v.layout.ty;
+                let r = match kind {
+                    CastKind::FloatToInt => {
+                        let ft = float_ty(from).expect("a float");
+                        let ty = self.scalar_of(to)?;
+                        if ty == Type::I128 {
+                            return Err(unsupported("float to 128-bit integer casts"));
+                        }
+                        self.b.ftoint(ft, ty, matches!(to.ty.kind(), ty::Int(_)), x)
+                    }
+                    CastKind::IntToFloat => {
+                        let ft = float_ty(to.ty).ok_or_else(|| unsupported(format!("casting to `{}`", to.ty)))?;
+                        if self.b.value_type(x) == Type::I128 {
+                            return Err(unsupported("128-bit integer to float casts"));
+                        }
+                        self.b.inttof(ft, matches!(from.kind(), ty::Int(_)), x)
+                    }
+                    _ => {
+                        let (a, b) = (float_ty(from).expect("a float"), float_ty(to.ty).expect("a float"));
+                        if a == b { x } else { self.b.fconvert(a, b, x) }
+                    }
+                };
+                Ok(scalar(r))
+            }
         }
     }
 
@@ -936,6 +1060,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let ptr = self.load_scalar(v)?;
                 let principal = data.principal().map(|p| self.tcx.instantiate_bound_regions_with_erased(p));
                 let vtable = self.tcx.vtable_allocation((src, principal));
+                self.m.vtables.push((src, data.principal_def_id()));
                 let addr = self.m.alloc_addr(vtable)?;
                 let meta = self.addr_value(addr, Size::ZERO);
                 Ok(pair(ptr, meta))
@@ -946,8 +1071,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     fn binop(&mut self, op: BinOp, a: Val<'tcx>, b: Val<'tcx>, dest: TyAndLayout<'tcx>) -> Result<Val<'tcx>> {
         let ty = a.layout.ty;
-        if ty.is_floating_point() {
-            return Err(unsupported("floating point"));
+        if let Some(ft) = float_ty(ty) {
+            return self.float_binop(op, ft, a, b, dest);
         }
         if matches!(a.layout.backend_repr, BackendRepr::ScalarPair(..)) {
             return Err(unsupported("operators on wide pointers"));
@@ -983,8 +1108,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     BinOp::SubWithOverflow => OverflowOp::Sub,
                     _ => OverflowOp::Mul,
                 });
-                if self.b.value_type(x) == Type::I128 {
-                    return Err(unsupported("overflow checks on 128-bit integers"));
+                if self.b.value_type(x) == Type::I128 && o == OverflowOp::Mul {
+                    return Err(unsupported("multiplication overflow checks on 128-bit integers"));
                 }
                 let (r, of) = self.b.overflow(o, s, x, y);
                 return Ok(Val { v: V::Pair(r, of), layout: dest });
@@ -1010,6 +1135,42 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
         };
         Ok(scalar(r))
+    }
+
+    fn float_binop(
+        &mut self,
+        op: BinOp,
+        ft: ir::FloatTy,
+        a: Val<'tcx>,
+        b: Val<'tcx>,
+        dest: TyAndLayout<'tcx>,
+    ) -> Result<Val<'tcx>> {
+        let x = self.load_scalar(a)?;
+        let y = self.load_scalar(b)?;
+        let r = match op {
+            BinOp::Add => self.b.fbinary(ir::FBinOp::Add, ft, x, y),
+            BinOp::Sub => self.b.fbinary(ir::FBinOp::Sub, ft, x, y),
+            BinOp::Mul => self.b.fbinary(ir::FBinOp::Mul, ft, x, y),
+            BinOp::Div => self.b.fbinary(ir::FBinOp::Div, ft, x, y),
+            BinOp::Rem => self.libm(if ft == ir::FloatTy::F32 { "fmodf" } else { "fmod" }, ft, &[x, y]),
+            BinOp::Eq => self.b.fcmp(ir::FCmp::Eq, ft, x, y),
+            BinOp::Ne => self.b.fcmp(ir::FCmp::Ne, ft, x, y),
+            BinOp::Lt => self.b.fcmp(ir::FCmp::Lt, ft, x, y),
+            BinOp::Le => self.b.fcmp(ir::FCmp::Le, ft, x, y),
+            BinOp::Gt => self.b.fcmp(ir::FCmp::Gt, ft, x, y),
+            BinOp::Ge => self.b.fcmp(ir::FCmp::Ge, ft, x, y),
+            _ => return Err(unsupported(format!("`{op:?}` on floats"))),
+        };
+        Ok(Val { v: V::Scalar(r), layout: dest })
+    }
+
+    /// Call a C math library function whose parameters and result are all
+    /// `ft`.
+    fn libm(&mut self, name: &str, ft: ir::FloatTy, args: &[Value]) -> Value {
+        let p = ir::Param { float: true, ..ir::Param::new(ft.bits_type()) };
+        let sig = ir::Signature { params: vec![p; args.len()], returns: vec![p] };
+        self.m.use_func(name, sig);
+        self.b.call(name, args, &[ft.bits_type()])[0]
     }
 
     // ---- terminators ----
@@ -1142,7 +1303,18 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             return Ok(());
         }
         if let ty::Dynamic(..) = ty.kind() {
-            return Err(unsupported("dropping trait objects"));
+            // The vtable's first entry is the concrete type's drop glue, or
+            // null when it has none.
+            let vtable = p.meta.ok_or_else(|| unsupported("a trait object without a vtable"))?;
+            let glue = self.b.load(PTR, vtable, 0);
+            let zero = self.b.iconst(PTR, 0);
+            let has_glue = self.b.cmp(Cmp::Ne, glue, zero);
+            let (call, _) = self.b.block(&[]);
+            self.b.branch(has_glue, (call, &[]), (t, &[]));
+            self.b.switch_to(call);
+            self.b.call_indirect(ir::Signature::new([PTR], []), glue, &[p.addr]);
+            self.b.jump(t, &[]);
+            return Ok(());
         }
         let ptr_layout = self.layout(Ty::new_mut_ptr(self.tcx, ty));
         let v = match p.meta {
@@ -1173,7 +1345,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 Instance::expect_resolve(self.tcx, ty::TypingEnv::fully_monomorphized(), def_id, fn_args, si.span);
             match inst.def {
                 InstanceKind::Intrinsic(def_id) => {
-                    if self.intrinsic(def_id, args, dest, target)? {
+                    if self.intrinsic(inst, si, args, dest, target)? {
                         return Ok(());
                     }
                     // Not one Athrad implements: call its fallback body.
@@ -1251,22 +1423,290 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
     /// call its fallback body instead.
     fn intrinsic(
         &mut self,
-        def_id: rustc_hir::def_id::DefId,
+        inst: Instance<'tcx>,
+        si: SourceInfo,
         args: &[rustc_span::Spanned<Operand<'tcx>>],
         dest: PlaceRef<'tcx>,
         target: Option<BasicBlock>,
     ) -> Result<bool> {
-        let def = self.tcx.intrinsic(def_id).expect("an intrinsic");
+        let def = self.tcx.intrinsic(inst.def_id()).expect("an intrinsic");
         let name = def.name.as_str();
+        let tcx = self.tcx;
+        let arg_ty = |f: &Self, i: usize| f.monomorphize(args[i].node.ty(f.mir, tcx));
+        let pointee = |f: &Self, i: usize| -> Result<TyAndLayout<'tcx>> {
+            let t = arg_ty(f, i);
+            let p = t.builtin_deref(true).ok_or_else(|| unsupported(format!("`{name}` of `{t}`")))?;
+            Ok(f.layout(p))
+        };
+        let signed_arg = |f: &Self, i: usize| matches!(arg_ty(f, i).kind(), ty::Int(_));
+        // Write a scalar result, resized to the destination's type.
+        let put = |f: &mut Self, v: Value, signed: bool| -> Result<()> {
+            if dest.layout.size.bytes() == 0 {
+                return Ok(());
+            }
+            let ty = f.scalar_of(dest.layout)?;
+            let v = f.b.resize(ty, v, signed);
+            f.write(dest, Val { v: V::Scalar(v), layout: dest.layout })
+        };
+        let mem = |f: &mut Self, func: &str, params: &[Type], ret: Type| {
+            f.m.use_func(func, ir::Signature::new(params.iter().copied(), [ret]));
+        };
+
         match name {
             "black_box" => {
                 let v = self.operand(&args[0].node)?;
                 self.write(dest, v)?;
             }
             "assume" | "cold_path" => {}
-            "abort" | "unreachable" => {
+            "abort" | "unreachable" | "breakpoint" => {
                 self.b.trap();
                 return Ok(true);
+            }
+            "assert_inhabited" | "assert_zero_valid" | "assert_mem_uninitialized_valid" => {
+                use rustc_middle::ty::layout::ValidityRequirement;
+                let req = ValidityRequirement::from_intrinsic(def.name).expect("an assert intrinsic");
+                let ty = inst.args.type_at(0);
+                let env = ty::TypingEnv::fully_monomorphized();
+                if !tcx.check_validity_requirement((req, env.as_query_input(ty))).unwrap_or(false) {
+                    return Err(unsupported(format!("`{name}::<{ty}>`, which panics")));
+                }
+            }
+            "ctpop" | "ctlz" | "ctlz_nonzero" | "cttz" | "cttz_nonzero" | "bswap" | "bitreverse" => {
+                let a = self.operand(&args[0].node)?;
+                let x = self.load_scalar(a)?;
+                let op = match name {
+                    "ctpop" => ir::UnOp::Popcnt,
+                    "ctlz" | "ctlz_nonzero" => ir::UnOp::Clz,
+                    "cttz" | "cttz_nonzero" => ir::UnOp::Ctz,
+                    "bswap" => ir::UnOp::Bswap,
+                    _ => ir::UnOp::Bitrev,
+                };
+                let r = self.b.unary(op, x);
+                put(self, r, false)?;
+            }
+            "rotate_left" | "rotate_right" => {
+                let (a, b) = (self.operand(&args[0].node)?, self.operand(&args[1].node)?);
+                let x = self.load_scalar(a)?;
+                let n = self.load_scalar(b)?;
+                let n = self.b.resize(self.b.value_type(x), n, false);
+                let op = if name == "rotate_left" { IBin::Rotl } else { IBin::Rotr };
+                let r = self.b.binary(op, x, n);
+                put(self, r, false)?;
+            }
+            "saturating_add" | "saturating_sub" => {
+                let signed = signed_arg(self, 0);
+                let (a, b) = (self.operand(&args[0].node)?, self.operand(&args[1].node)?);
+                let x = self.load_scalar(a)?;
+                let y = self.load_scalar(b)?;
+                let ty = self.b.value_type(x);
+
+                let add = name == "saturating_add";
+                let (r, of) = self.b.overflow(if add { OverflowOp::Add } else { OverflowOp::Sub }, signed, x, y);
+                let bits = ty.bits();
+                let clamp = if signed {
+                    // Overflow goes toward the sign of y (add) or away from it (sub).
+                    let max = self.b.iconst(ty, (1i128 << (bits - 1)) - 1);
+                    let min = self.b.iconst(ty, -(1i128 << (bits - 1)));
+                    let zero = self.b.iconst(ty, 0);
+                    let y_neg = self.b.cmp(Cmp::SLt, y, zero);
+                    if add { self.b.select(y_neg, min, max) } else { self.b.select(y_neg, max, min) }
+                } else if add {
+                    self.b.iconst(ty, -1)
+                } else {
+                    self.b.iconst(ty, 0)
+                };
+                let v = self.b.select(of, clamp, r);
+                put(self, v, signed)?;
+            }
+            "exact_div" | "unchecked_div" | "unchecked_rem" | "unchecked_add" | "unchecked_sub" | "unchecked_mul"
+            | "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "unchecked_shl" | "unchecked_shr"
+            | "add_with_overflow" | "sub_with_overflow" | "mul_with_overflow" | "three_way_compare" => {
+                let op = match name {
+                    "exact_div" | "unchecked_div" => BinOp::Div,
+                    "unchecked_rem" => BinOp::Rem,
+                    "unchecked_add" | "wrapping_add" => BinOp::Add,
+                    "unchecked_sub" | "wrapping_sub" => BinOp::Sub,
+                    "unchecked_mul" | "wrapping_mul" => BinOp::Mul,
+                    "unchecked_shl" => BinOp::Shl,
+                    "unchecked_shr" => BinOp::Shr,
+                    "add_with_overflow" => BinOp::AddWithOverflow,
+                    "sub_with_overflow" => BinOp::SubWithOverflow,
+                    "mul_with_overflow" => BinOp::MulWithOverflow,
+                    _ => BinOp::Cmp,
+                };
+                let (a, b) = (self.operand(&args[0].node)?, self.operand(&args[1].node)?);
+                let v = self.binop(op, a, b, dest.layout)?;
+                self.write(dest, v)?;
+            }
+            "size_of_val" | "align_of_val" => {
+                let layout = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let meta = match a.v {
+                    V::Pair(..) => Some(self.load_pair(a)?.1),
+                    _ => None,
+                };
+                let (size, align) = self.size_align_of(layout, meta)?;
+                put(self, if name == "size_of_val" { size } else { align }, false)?;
+            }
+            "vtable_size" | "vtable_align" => {
+                let a = self.operand(&args[0].node)?;
+                let vt = self.load_scalar(a)?;
+                let v = self.b.load(PTR, vt, if name == "vtable_size" { 8 } else { 16 });
+                put(self, v, false)?;
+            }
+            "write_bytes" | "volatile_set_memory" => {
+                let elem = pointee(self, 0)?;
+                let d = self.operand(&args[0].node)?;
+                let d = self.load_scalar(d)?;
+                let v = self.operand(&args[1].node)?;
+                let v = self.load_scalar(v)?;
+                let v = self.b.resize(Type::I32, v, false);
+                let n = self.operand(&args[2].node)?;
+                let n = self.load_scalar(n)?;
+                let k = self.b.iconst(PTR, elem.size.bytes().into());
+                let bytes = self.b.binary(IBin::Mul, n, k);
+                mem(self, "memset", &[PTR, Type::I32, PTR], PTR);
+                self.b.call("memset", &[d, v, bytes], &[PTR]);
+            }
+            "copy" | "copy_nonoverlapping" | "volatile_copy_memory" | "volatile_copy_nonoverlapping_memory" => {
+                let elem = pointee(self, 0)?;
+                // `copy(src, dst, n)`; the volatile ones are `(dst, src, n)`.
+                let (si_, di) = if name.starts_with("volatile") { (1, 0) } else { (0, 1) };
+                let src = self.operand(&args[si_].node)?;
+                let src = self.load_scalar(src)?;
+                let dst = self.operand(&args[di].node)?;
+                let dst = self.load_scalar(dst)?;
+                let n = self.operand(&args[2].node)?;
+                let n = self.load_scalar(n)?;
+                let k = self.b.iconst(PTR, elem.size.bytes().into());
+                let bytes = self.b.binary(IBin::Mul, n, k);
+                mem(self, "memmove", &[PTR, PTR, PTR], PTR);
+                self.b.call("memmove", &[dst, src, bytes], &[PTR]);
+            }
+            "volatile_load" | "unaligned_volatile_load" => {
+                let layout = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let addr = self.load_scalar(a)?;
+                let v = self.read(PlaceRef { addr, meta: None, layout })?;
+                self.write(dest, v)?;
+            }
+            "volatile_store" | "unaligned_volatile_store" | "nontemporal_store" => {
+                let layout = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let addr = self.load_scalar(a)?;
+                let v = self.operand(&args[1].node)?;
+                self.write(PlaceRef { addr, meta: None, layout }, v)?;
+            }
+            "compare_bytes" => {
+                let mut vs = Vec::new();
+                for a in &args[..3] {
+                    let v = self.operand(&a.node)?;
+                    vs.push(self.load_scalar(v)?);
+                }
+                mem(self, "memcmp", &[PTR, PTR, PTR], Type::I32);
+                let r = self.b.call("memcmp", &vs, &[Type::I32])[0];
+                put(self, r, true)?;
+            }
+            "raw_eq" => {
+                let layout = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let a = self.load_scalar(a)?;
+                let b = self.operand(&args[1].node)?;
+                let b = self.load_scalar(b)?;
+                let n = self.b.iconst(PTR, layout.size.bytes().into());
+                mem(self, "memcmp", &[PTR, PTR, PTR], Type::I32);
+                let r = self.b.call("memcmp", &[a, b, n], &[Type::I32])[0];
+                let zero = self.b.iconst(Type::I32, 0);
+                let eq = self.b.cmp(Cmp::Eq, r, zero);
+                put(self, eq, false)?;
+            }
+            "ptr_offset_from" | "ptr_offset_from_unsigned" => {
+                let elem = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let a = self.load_scalar(a)?;
+                let b = self.operand(&args[1].node)?;
+                let b = self.load_scalar(b)?;
+                let d = self.b.sub(a, b);
+                let k = self.b.iconst(PTR, elem.size.bytes().max(1).into());
+                let op = if name == "ptr_offset_from" { IBin::SDiv } else { IBin::UDiv };
+                let r = self.b.binary(op, d, k);
+                put(self, r, true)?;
+            }
+            "arith_offset" => {
+                let elem = pointee(self, 0)?;
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                let n = self.operand(&args[1].node)?;
+                let n = self.load_scalar(n)?;
+                let k = self.b.iconst(PTR, elem.size.bytes().into());
+                let o = self.b.binary(IBin::Mul, n, k);
+                let r = self.b.add(p, o);
+                put(self, r, false)?;
+            }
+            "ptr_mask" => {
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                let m = self.operand(&args[1].node)?;
+                let m = self.load_scalar(m)?;
+                let r = self.b.binary(IBin::And, p, m);
+                put(self, r, false)?;
+            }
+            "discriminant_value" => {
+                let layout = pointee(self, 0)?;
+                let a = self.operand(&args[0].node)?;
+                let addr = self.load_scalar(a)?;
+                let d = self.discriminant(PlaceRef { addr, meta: None, layout }, dest.layout)?;
+                put(self, d, false)?;
+            }
+            "catch_unwind" => return Err(unsupported("catching panics")),
+            _ if float_intrinsic(name).is_some() => {
+                let (op, ft) = float_intrinsic(name).expect("a float intrinsic");
+                let ft = ft.or_else(|| float_ty(inst.args.type_at(0)));
+                let ft = ft.ok_or_else(|| unsupported(format!("the `{name}` intrinsic on this type")))?;
+                let mut xs = Vec::new();
+                for a in args {
+                    let v = self.operand(&a.node)?;
+                    xs.push(self.load_scalar(v)?);
+                }
+                let f32 = ft == ir::FloatTy::F32;
+                let r = match op {
+                    FloatIntrinsic::Un(op) => self.b.funary(op, ft, xs[0]),
+                    FloatIntrinsic::Bin(op) => self.b.fbinary(op, ft, xs[0], xs[1]),
+                    FloatIntrinsic::MinMaxNum(max) => {
+                        // The other operand when one is NaN.
+                        let m = self.b.fbinary(if max { ir::FBinOp::Max } else { ir::FBinOp::Min }, ft, xs[0], xs[1]);
+                        let x_nan = self.b.fcmp(ir::FCmp::Uno, ft, xs[0], xs[0]);
+                        let y_nan = self.b.fcmp(ir::FCmp::Uno, ft, xs[1], xs[1]);
+                        let m = self.b.select(y_nan, xs[0], m);
+                        self.b.select(x_nan, xs[1], m)
+                    }
+                    FloatIntrinsic::Libm(base) => {
+                        let name = if f32 { format!("{base}f") } else { base.to_owned() };
+                        self.libm(&name, ft, &xs)
+                    }
+                    FloatIntrinsic::Powi => {
+                        let name = if f32 { "__powisf2" } else { "__powidf2" };
+                        let fp = ir::Param { float: true, ..ir::Param::new(ft.bits_type()) };
+                        let sig = ir::Signature { params: vec![fp, ir::Param::new(Type::I32)], returns: vec![fp] };
+                        self.m.use_func(name, sig);
+                        self.b.call(name, &xs, &[ft.bits_type()])[0]
+                    }
+                    FloatIntrinsic::ToInt => {
+                        let ty = self.scalar_of(dest.layout)?;
+                        self.b.ftoint(ft, ty, matches!(dest.layout.ty.kind(), ty::Int(_)), xs[0])
+                    }
+                };
+                put(self, r, false)?;
+            }
+            // Intrinsics that are constants once their types are known:
+            // `type_name`, `type_id`, `needs_drop`, `variant_count`, ...
+            _ if args.is_empty() && def.must_be_overridden => {
+                let env = ty::TypingEnv::fully_monomorphized();
+                let value = tcx
+                    .const_eval_instance(env, inst, si.span)
+                    .map_err(|_| unsupported(format!("the `{name}` intrinsic")))?;
+                let v = self.const_value(value, dest.layout.ty)?;
+                self.write(dest, v)?;
             }
             _ if !def.must_be_overridden => return Ok(false),
             _ => return Err(unsupported(format!("the `{name}` intrinsic"))),
@@ -1376,4 +1816,72 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
         Ok(())
     }
+}
+
+/// The float format of a type, if it is `f32` or `f64`.
+fn float_ty(ty: Ty<'_>) -> Option<ir::FloatTy> {
+    match ty.kind() {
+        ty::Float(ty::FloatTy::F32) => Some(ir::FloatTy::F32),
+        ty::Float(ty::FloatTy::F64) => Some(ir::FloatTy::F64),
+        _ => None,
+    }
+}
+
+enum FloatIntrinsic {
+    Un(ir::FUnOp),
+    Bin(ir::FBinOp),
+    /// `minimum_number_nsz` and `maximum_number_nsz`: a NaN loses.
+    MinMaxNum(bool),
+    /// The C math library function of this name, with an `f` for `f32`.
+    Libm(&'static str),
+    Powi,
+    ToInt,
+}
+
+/// The float intrinsics, and their format when the name says it
+/// (`sqrtf64`); `None` takes it from the type argument (`fabs::<f32>`).
+fn float_intrinsic(name: &str) -> Option<(FloatIntrinsic, Option<ir::FloatTy>)> {
+    use FloatIntrinsic::*;
+    let (base, ft) = if let Some(b) = name.strip_suffix("f32").or_else(|| name.strip_suffix("_f32")) {
+        (b, Some(ir::FloatTy::F32))
+    } else if let Some(b) = name.strip_suffix("f64").or_else(|| name.strip_suffix("_f64")) {
+        (b, Some(ir::FloatTy::F64))
+    } else {
+        (name, None)
+    };
+    let base = base.strip_suffix('_').unwrap_or(base);
+    let op = match base {
+        "sqrt" => Un(ir::FUnOp::Sqrt),
+        "floor" => Un(ir::FUnOp::Floor),
+        "ceil" => Un(ir::FUnOp::Ceil),
+        "trunc" => Un(ir::FUnOp::Trunc),
+        "round_ties_even" => Un(ir::FUnOp::Nearest),
+        "fabs" => Un(ir::FUnOp::Abs),
+        "copysign" => Bin(ir::FBinOp::Copysign),
+        "minimum" => Bin(ir::FBinOp::Min),
+        "maximum" => Bin(ir::FBinOp::Max),
+        "minimum_number_nsz" => MinMaxNum(false),
+        "maximum_number_nsz" => MinMaxNum(true),
+        "fadd_fast" | "fadd_algebraic" => Bin(ir::FBinOp::Add),
+        "fsub_fast" | "fsub_algebraic" => Bin(ir::FBinOp::Sub),
+        "fmul_fast" | "fmul_algebraic" => Bin(ir::FBinOp::Mul),
+        "fdiv_fast" | "fdiv_algebraic" => Bin(ir::FBinOp::Div),
+        "frem_fast" | "frem_algebraic" => Libm("fmod"),
+        "round" => Libm("round"),
+        "pow" => Libm("pow"),
+        "exp" => Libm("exp"),
+        "exp2" => Libm("exp2"),
+        "log" => Libm("log"),
+        "log2" => Libm("log2"),
+        "log10" => Libm("log10"),
+        "sin" => Libm("sin"),
+        "cos" => Libm("cos"),
+        "fma" | "fmuladd" => Libm("fma"),
+        "powi" => Powi,
+        "float_to_int_unchecked" => ToInt,
+        _ => return None,
+    };
+    // The fast and algebraic ones, and `fabs`, `float_to_int_unchecked`,
+    // take their format from the type argument.
+    Some((op, ft))
 }

@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 fn main() {
     let mut v: Vec<u64> = Vec::new();
     for i in 0..10 {
@@ -19,11 +17,11 @@ fn main() {
     let b = Box::new([1u8, 2, 3]);
     println!("{:?} {}", b, b.len());
 
-    let mut m = HashMap::new();
-    for w in "the cat and the hat and the bat".split_whitespace() {
-        *m.entry(w).or_insert(0) += 1;
-    }
-    let mut counts: Vec<_> = m.into_iter().collect();
-    counts.sort();
-    println!("{counts:?}");
+    let mut pairs = vec![("b", 2), ("a", 9), ("c", 1), ("a", 3)];
+    pairs.sort();
+    println!("{pairs:?}");
+    pairs.sort_by_key(|p| p.1);
+    println!("{pairs:?} {:?}", pairs.iter().max_by_key(|p| p.1));
+    let nested: Vec<Vec<String>> = (1..4).map(|n| (0..n).map(|i| i.to_string()).collect()).collect();
+    println!("{nested:?}");
 }

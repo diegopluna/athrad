@@ -73,6 +73,10 @@ pub enum Ext {
 pub struct Param {
     pub ty: Type,
     pub ext: Ext,
+    /// A float in the calling convention: passed in a floating-point
+    /// register. Inside a function it is the integer of its bits, as every
+    /// float in Athrad IR is.
+    pub float: bool,
     /// The pointer to memory the callee writes its return value into. The
     /// calling convention may give it a register of its own (x8 on aarch64).
     pub sret: bool,
@@ -80,7 +84,7 @@ pub struct Param {
 
 impl Param {
     pub fn new(ty: Type) -> Self {
-        Param { ty, ext: Ext::None, sret: false }
+        Param { ty, ext: Ext::None, float: false, sret: false }
     }
 }
 
@@ -192,6 +196,81 @@ pub enum BinOp {
     Shl,
     UShr,
     SShr,
+    /// Rotates take the amount modulo the bit width.
+    Rotl,
+    Rotr,
+}
+
+/// Bit operations on one integer, giving the same type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnOp {
+    /// Number of one bits.
+    Popcnt,
+    /// Leading zero bits; the bit width for zero.
+    Clz,
+    /// Trailing zero bits; the bit width for zero.
+    Ctz,
+    /// Reverse the bytes.
+    Bswap,
+    /// Reverse the bits.
+    Bitrev,
+}
+
+/// An IEEE float format. Float values in the IR are integers of their bits
+/// (`F32` in an `I32`, `F64` in an `I64`); float operations say how to read
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FloatTy {
+    F32,
+    F64,
+}
+
+impl FloatTy {
+    /// The integer type that holds its bits.
+    pub fn bits_type(self) -> Type {
+        match self {
+            FloatTy::F32 => Type::I32,
+            FloatTy::F64 => Type::I64,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    /// IEEE `minimum`/`maximum`: NaN if either is NaN.
+    Min,
+    Max,
+    /// The magnitude of the first, the sign of the second.
+    Copysign,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FUnOp {
+    Neg,
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Trunc,
+    /// Round to nearest, ties to even.
+    Nearest,
+}
+
+/// Float comparisons. `Ne` and `Uno` are true when either side is NaN; the
+/// others are false then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FCmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Uno,
 }
 
 /// Arithmetic that also reports whether the exact result fit.
@@ -221,6 +300,31 @@ pub enum Op {
     /// An integer constant. The bits are truncated to the type.
     Const(Type, i128),
     Binary(BinOp, Value, Value),
+    Unary(UnOp, Value),
+    FBinary(FBinOp, FloatTy, Value, Value),
+    FUnary(FUnOp, FloatTy, Value),
+    /// An `I8` that is 0 or 1.
+    FCmp(FCmp, FloatTy, Value, Value),
+    /// Float to integer as Rust's `as` does it: rounding toward zero,
+    /// saturating, NaN to 0.
+    FToInt {
+        from: FloatTy,
+        to: Type,
+        signed: bool,
+        v: Value,
+    },
+    /// Integer to float, rounding to nearest.
+    IntToF {
+        to: FloatTy,
+        signed: bool,
+        v: Value,
+    },
+    /// Widen or narrow a float.
+    FConvert {
+        from: FloatTy,
+        to: FloatTy,
+        v: Value,
+    },
     /// The wrapped result and an `I8` that is 1 if it overflowed, treating
     /// the operands as signed or unsigned.
     Overflow(OverflowOp, bool, Value, Value),
@@ -443,6 +547,35 @@ impl FunctionBuilder {
     pub fn binary(&mut self, op: BinOp, a: Value, b: Value) -> Value {
         let ty = self.value_type(a);
         self.def(ty, Op::Binary(op, a, b))
+    }
+
+    pub fn unary(&mut self, op: UnOp, a: Value) -> Value {
+        let ty = self.value_type(a);
+        self.def(ty, Op::Unary(op, a))
+    }
+
+    pub fn fbinary(&mut self, op: FBinOp, ft: FloatTy, a: Value, b: Value) -> Value {
+        self.def(ft.bits_type(), Op::FBinary(op, ft, a, b))
+    }
+
+    pub fn funary(&mut self, op: FUnOp, ft: FloatTy, a: Value) -> Value {
+        self.def(ft.bits_type(), Op::FUnary(op, ft, a))
+    }
+
+    pub fn fcmp(&mut self, cmp: FCmp, ft: FloatTy, a: Value, b: Value) -> Value {
+        self.def(Type::I8, Op::FCmp(cmp, ft, a, b))
+    }
+
+    pub fn ftoint(&mut self, from: FloatTy, to: Type, signed: bool, v: Value) -> Value {
+        self.def(to, Op::FToInt { from, to, signed, v })
+    }
+
+    pub fn inttof(&mut self, to: FloatTy, signed: bool, v: Value) -> Value {
+        self.def(to.bits_type(), Op::IntToF { to, signed, v })
+    }
+
+    pub fn fconvert(&mut self, from: FloatTy, to: FloatTy, v: Value) -> Value {
+        self.def(to.bits_type(), Op::FConvert { from, to, v })
     }
 
     pub fn add(&mut self, a: Value, b: Value) -> Value {
@@ -692,6 +825,17 @@ impl fmt::Display for Function {
                 match &inst.op {
                     Op::Const(ty, n) => writeln!(f, "const.{ty} {n}")?,
                     Op::Binary(op, a, b) => writeln!(f, "{} {a}, {b}", lower(op))?,
+                    Op::Unary(op, a) => writeln!(f, "{} {a}", lower(op))?,
+                    Op::FBinary(op, ft, a, b) => writeln!(f, "f{}.{} {a}, {b}", lower(op), lower(ft))?,
+                    Op::FUnary(op, ft, a) => writeln!(f, "f{}.{} {a}", lower(op), lower(ft))?,
+                    Op::FCmp(c, ft, a, b) => writeln!(f, "fcmp.{}.{} {a}, {b}", lower(c), lower(ft))?,
+                    Op::FToInt { from, to, signed, v } => {
+                        writeln!(f, "{}.{}.{to} {v}", if *signed { "ftosi" } else { "ftoui" }, lower(from))?
+                    }
+                    Op::IntToF { to, signed, v } => {
+                        writeln!(f, "{}.{} {v}", if *signed { "sitof" } else { "uitof" }, lower(to))?
+                    }
+                    Op::FConvert { from, to, v } => writeln!(f, "fconvert.{}.{} {v}", lower(from), lower(to))?,
                     Op::Overflow(op, signed, a, b) => {
                         writeln!(f, "{}{}_overflow {a}, {b}", if *signed { "s" } else { "u" }, lower(op))?
                     }

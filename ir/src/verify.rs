@@ -161,9 +161,46 @@ impl Checker<'_> {
         Ok(match &inst.op {
             Op::Const(ty, _) => vec![*ty],
             Op::Binary(op, a, b) => vec![same(*a, *b, op)?],
+            Op::Unary(_, a) => vec![use_(*a)?],
+            Op::FBinary(op, ft, a, b) => {
+                if same(*a, *b, op)? != ft.bits_type() {
+                    return Err(format!("{op:?} of {ft:?} on {}", use_(*a)?));
+                }
+                vec![ft.bits_type()]
+            }
+            Op::FUnary(op, ft, a) => {
+                if use_(*a)? != ft.bits_type() {
+                    return Err(format!("{op:?} of {ft:?} on {}", use_(*a)?));
+                }
+                vec![ft.bits_type()]
+            }
+            Op::FCmp(c, ft, a, b) => {
+                if same(*a, *b, c)? != ft.bits_type() {
+                    return Err(format!("{c:?} of {ft:?} on {}", use_(*a)?));
+                }
+                vec![Type::I8]
+            }
+            Op::FToInt { from, to, v, .. } => {
+                if use_(*v)? != from.bits_type() || *to == Type::I128 {
+                    return Err(format!("conversion of {v} from {from:?} to {to}"));
+                }
+                vec![*to]
+            }
+            Op::IntToF { to, v, .. } => {
+                if use_(*v)? == Type::I128 {
+                    return Err(format!("conversion of i128 {v} to {to:?}"));
+                }
+                vec![to.bits_type()]
+            }
+            Op::FConvert { from, to, v } => {
+                if use_(*v)? != from.bits_type() || from == to {
+                    return Err(format!("conversion of {v} from {from:?} to {to:?}"));
+                }
+                vec![to.bits_type()]
+            }
             Op::Overflow(op, _, a, b) => {
                 let t = same(*a, *b, op)?;
-                if t == Type::I128 {
+                if t == Type::I128 && *op == crate::OverflowOp::Mul {
                     return Err(format!("{op:?} overflow check of i128"));
                 }
                 vec![t, Type::I8]

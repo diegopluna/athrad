@@ -52,8 +52,17 @@ pub(crate) fn scalar_type(cx: Cx<'_>, s: Scalar) -> Result<ir::Type> {
             let size = s.size(&cx).bytes();
             ir::Type::of_bytes(size).ok_or_else(|| unsupported(format!("a {size}-byte integer")))
         }
-        Primitive::Float(_) => Err(unsupported("floating point")),
+        // A float is the integer of its bits; its operations say it is one.
+        Primitive::Float(rustc_abi::Float::F32) => Ok(ir::Type::I32),
+        Primitive::Float(rustc_abi::Float::F64) => Ok(ir::Type::I64),
+        Primitive::Float(f) => Err(unsupported(format!("`{f:?}`"))),
     }
+}
+
+/// Whether a scalar is a float, which the calling convention passes in a
+/// floating-point register.
+pub(crate) fn is_float(s: Scalar) -> bool {
+    matches!(s.primitive(), Primitive::Float(_))
 }
 
 /// Whether a scalar is a signed integer.
@@ -81,6 +90,8 @@ fn reg_type(reg: Reg) -> Result<ir::Type> {
         (RegKind::Integer, 3..=4) => Ok(ir::Type::I32),
         (RegKind::Integer, 5..=8) => Ok(ir::Type::I64),
         (RegKind::Integer, 9..=16) => Ok(ir::Type::I128),
+        (RegKind::Float, 4) => Ok(ir::Type::I32),
+        (RegKind::Float, 8) => Ok(ir::Type::I64),
         _ => Err(unsupported(format!("passing a value in a {reg:?} register"))),
     }
 }
@@ -113,26 +124,45 @@ pub(crate) fn cast_pieces(cast: &CastTarget) -> Result<Vec<(Size, ir::Type)>> {
     Ok(out)
 }
 
+/// Which of [`cast_pieces`] go in floating-point registers.
+fn cast_floats(cast: &CastTarget) -> Vec<bool> {
+    let unit = cast.rest.unit.size.bytes();
+    let count = cast.rest.total.bytes().checked_div(unit).unwrap_or(0) as usize;
+    let rest = if cast.rest_offset.is_some() { 1 } else { count };
+    let mut v: Vec<bool> = cast.prefix.iter().map(|r| r.kind == RegKind::Float).collect();
+    v.extend(std::iter::repeat_n(cast.rest.unit.kind == RegKind::Float, rest));
+    // A remainder is always integer.
+    v.push(false);
+    v
+}
+
 /// The machine parameters for one Rust argument.
 pub(crate) fn arg_params<'tcx>(cx: Cx<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Result<Vec<ir::Param>> {
-    let p = |ty, attrs: &ArgAttributes| ir::Param { ty, ext: ext(attrs), sret: false };
+    let p = |ty, float, attrs: &ArgAttributes| ir::Param { ty, ext: ext(attrs), float, sret: false };
     Ok(match &arg.mode {
         PassMode::Ignore => vec![],
         PassMode::Direct(attrs) => match arg.layout.backend_repr {
-            BackendRepr::Scalar(s) => vec![p(scalar_type(cx, s)?, attrs)],
+            BackendRepr::Scalar(s) => vec![p(scalar_type(cx, s)?, is_float(s), attrs)],
             _ => return Err(unsupported("passing a vector")),
         },
         PassMode::Pair(a_attrs, b_attrs) => match arg.layout.backend_repr {
-            BackendRepr::ScalarPair(a, b) => vec![p(scalar_type(cx, a)?, a_attrs), p(scalar_type(cx, b)?, b_attrs)],
+            BackendRepr::ScalarPair(a, b) => {
+                vec![p(scalar_type(cx, a)?, is_float(a), a_attrs), p(scalar_type(cx, b)?, is_float(b), b_attrs)]
+            }
             _ => unreachable!("pair pass mode for a non-pair layout"),
         },
         PassMode::Cast { cast, pad_i32 } => {
             if *pad_i32 {
                 return Err(unsupported("padded argument casts"));
             }
-            cast_pieces(cast)?.into_iter().map(|(_, ty)| ir::Param::new(ty)).collect()
+            let floats = cast_floats(cast);
+            cast_pieces(cast)?
+                .into_iter()
+                .zip(floats)
+                .map(|((_, ty), float)| ir::Param { float, ..ir::Param::new(ty) })
+                .collect()
         }
-        PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => vec![p(ir::PTR, attrs)],
+        PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => vec![p(ir::PTR, false, attrs)],
         PassMode::Indirect { on_stack: true, .. } => return Err(unsupported("arguments passed by value on the stack")),
         PassMode::Indirect { meta_attrs: Some(_), .. } => return Err(unsupported("unsized arguments")),
     })
@@ -146,7 +176,7 @@ pub(crate) fn signature<'tcx>(cx: Cx<'tcx>, abi: &FnAbi<'tcx, Ty<'tcx>>) -> Resu
     let mut sig = ir::Signature::default();
     match &abi.ret.mode {
         PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => {
-            sig.params.push(ir::Param { ty: ir::PTR, ext: ext(attrs), sret: true })
+            sig.params.push(ir::Param { ty: ir::PTR, ext: ext(attrs), float: false, sret: true })
         }
         PassMode::Indirect { .. } => return Err(unsupported("this return value")),
         _ => sig.returns = arg_params(cx, &abi.ret)?,

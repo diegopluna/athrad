@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cranelift_codegen::Context;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{
     self as clif, AbiParam, ArgumentPurpose, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
     TrapCode, types,
@@ -70,12 +70,22 @@ pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<
         obj.define_data(id, &desc).with_context(|| format!("defining data {}", d.name))?;
     }
 
+    let mut sigs: HashMap<&str, &ir::Signature> = HashMap::new();
+    for imp in &module.imports {
+        if let ir::ImportKind::Func(sig) = &imp.kind {
+            sigs.insert(&imp.name, sig);
+        }
+    }
+    for func in &module.functions {
+        sigs.insert(&func.name, &func.sig);
+    }
+
     let mut ctx = obj.make_context();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut unwind_entries = Vec::new();
     for func in &module.functions {
         ctx.func.signature = signature(&obj, &func.sig);
-        lower(&mut obj, &ids, func, &mut ctx, &mut fb_ctx);
+        lower(&mut obj, &ids, &sigs, func, &mut ctx, &mut fb_ctx);
         let Id::Func(id) = ids[func.name.as_str()] else { unreachable!() };
         obj.define_function(id, &mut ctx)
             .map_err(|e| anyhow!("{e:?}"))
@@ -129,11 +139,43 @@ fn clif_type(ty: ir::Type) -> clif::Type {
     }
 }
 
+/// The Cranelift type a parameter has at the call boundary.
+fn param_type(p: &ir::Param) -> clif::Type {
+    match (p.float, p.ty) {
+        (true, ir::Type::I32) => types::F32,
+        (true, ir::Type::I64) => types::F64,
+        (true, other) => panic!("verified IR: no {other} float"),
+        (false, ty) => clif_type(ty),
+    }
+}
+
+fn float_type(ft: ir::FloatTy) -> clif::Type {
+    match ft {
+        ir::FloatTy::F32 => types::F32,
+        ir::FloatTy::F64 => types::F64,
+    }
+}
+
+/// Move values between their IR integer type and the float type `params`
+/// says the calling convention wants. `to_abi` goes from IR to the call.
+fn abi_values(b: &mut FunctionBuilder, params: &[ir::Param], vs: &[clif::Value], to_abi: bool) -> Vec<clif::Value> {
+    vs.iter()
+        .zip(params)
+        .map(|(&v, p)| {
+            if !p.float {
+                return v;
+            }
+            let ty = if to_abi { param_type(p) } else { clif_type(p.ty) };
+            b.ins().bitcast(ty, MemFlagsData::new(), v)
+        })
+        .collect()
+}
+
 fn abi_param(p: &ir::Param) -> AbiParam {
     let a = if p.sret {
-        AbiParam::special(clif_type(p.ty), ArgumentPurpose::StructReturn)
+        AbiParam::special(param_type(p), ArgumentPurpose::StructReturn)
     } else {
-        AbiParam::new(clif_type(p.ty))
+        AbiParam::new(param_type(p))
     };
     match p.ext {
         ir::Ext::None => a,
@@ -152,6 +194,7 @@ fn signature(obj: &ObjectModule, sig: &ir::Signature) -> clif::Signature {
 fn lower(
     obj: &mut ObjectModule,
     ids: &HashMap<&str, Id>,
+    sigs: &HashMap<&str, &ir::Signature>,
     func: &ir::Function,
     ctx: &mut Context,
     fb_ctx: &mut FunctionBuilderContext,
@@ -179,6 +222,16 @@ fn lower(
         }
     }
 
+    // Cranelift's entry block takes the parameters as the calling convention
+    // passes them; hand them to the IR's entry block as integers.
+    let entry = b.create_block();
+    b.append_block_params_for_function_params(entry);
+    b.switch_to_block(entry);
+    let params = b.block_params(entry).to_vec();
+    let params = abi_values(&mut b, &func.sig.params, &params, false);
+    let params: Vec<BlockArg> = params.into_iter().map(BlockArg::Value).collect();
+    b.ins().jump(blocks[0], &params);
+
     // Walk in reverse postorder so definitions are lowered before their uses.
     for i in reverse_postorder(func) {
         let block = &func.blocks[i];
@@ -193,6 +246,11 @@ fn lower(
             };
             let results: Vec<clif::Value> = match &inst.op {
                 ir::Op::Const(ty, n) => vec![iconst(&mut b, *ty, *n)],
+                ir::Op::Binary(op @ (ir::BinOp::UDiv | ir::BinOp::URem | ir::BinOp::SDiv | ir::BinOp::SRem), x, y)
+                    if func.values[x.0 as usize] == ir::Type::I128 =>
+                {
+                    vec![div128(&mut b, *op, get(&values, *x), get(&values, *y))]
+                }
                 ir::Op::Binary(op, x, y) => {
                     let (x, y) = (get(&values, *x), get(&values, *y));
                     let ins = b.ins();
@@ -210,7 +268,30 @@ fn lower(
                         ir::BinOp::Shl => ins.ishl(x, y),
                         ir::BinOp::UShr => ins.ushr(x, y),
                         ir::BinOp::SShr => ins.sshr(x, y),
+                        ir::BinOp::Rotl => ins.rotl(x, y),
+                        ir::BinOp::Rotr => ins.rotr(x, y),
                     }]
+                }
+                ir::Op::Unary(op, x) => {
+                    let x = get(&values, *x);
+                    let narrow = b.func.dfg.value_type(x) == types::I8;
+                    let ins = b.ins();
+                    vec![match op {
+                        ir::UnOp::Popcnt => ins.popcnt(x),
+                        ir::UnOp::Clz => ins.clz(x),
+                        ir::UnOp::Ctz => ins.ctz(x),
+                        // One byte reversed is itself.
+                        ir::UnOp::Bswap if narrow => x,
+                        ir::UnOp::Bswap => ins.bswap(x),
+                        ir::UnOp::Bitrev => ins.bitrev(x),
+                    }]
+                }
+                ir::Op::Overflow(op @ (ir::OverflowOp::Add | ir::OverflowOp::Sub), signed, x, y)
+                    if func.values[x.0 as usize] == ir::Type::I128 =>
+                {
+                    let (x, y) = (get(&values, *x), get(&values, *y));
+                    let (r, of) = addsub128_overflow(&mut b, *op, *signed, x, y);
+                    vec![r, of]
                 }
                 ir::Op::Overflow(op, signed, x, y) => {
                     let (x, y) = (get(&values, *x), get(&values, *y));
@@ -268,15 +349,90 @@ fn lower(
                 }
                 ir::Op::Call(name, args) => {
                     let callee = func_ref(&mut b, name);
+                    let sig = sigs[name.as_str()];
                     let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
+                    let args = abi_values(&mut b, &sig.params, &args, true);
                     let call = b.ins().call(callee, &args);
-                    b.inst_results(call).to_vec()
+                    let results = b.inst_results(call).to_vec();
+                    abi_values(&mut b, &sig.returns, &results, false)
                 }
                 ir::Op::CallIndirect(sig, callee, args) => {
-                    let sig = b.import_signature(signature(obj, sig));
+                    let clif_sig = b.import_signature(signature(obj, sig));
                     let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
-                    let call = b.ins().call_indirect(sig, get(&values, *callee), &args);
-                    b.inst_results(call).to_vec()
+                    let args = abi_values(&mut b, &sig.params, &args, true);
+                    let call = b.ins().call_indirect(clif_sig, get(&values, *callee), &args);
+                    let results = b.inst_results(call).to_vec();
+                    abi_values(&mut b, &sig.returns, &results, false)
+                }
+                ir::Op::FBinary(op, ft, x, y) => {
+                    let t = float_type(*ft);
+                    let x = b.ins().bitcast(t, MemFlagsData::new(), get(&values, *x));
+                    let y = b.ins().bitcast(t, MemFlagsData::new(), get(&values, *y));
+                    let ins = b.ins();
+                    let r = match op {
+                        ir::FBinOp::Add => ins.fadd(x, y),
+                        ir::FBinOp::Sub => ins.fsub(x, y),
+                        ir::FBinOp::Mul => ins.fmul(x, y),
+                        ir::FBinOp::Div => ins.fdiv(x, y),
+                        ir::FBinOp::Min => ins.fmin(x, y),
+                        ir::FBinOp::Max => ins.fmax(x, y),
+                        ir::FBinOp::Copysign => ins.fcopysign(x, y),
+                    };
+                    vec![b.ins().bitcast(clif_type(ft.bits_type()), MemFlagsData::new(), r)]
+                }
+                ir::Op::FUnary(op, ft, x) => {
+                    let t = float_type(*ft);
+                    let x = b.ins().bitcast(t, MemFlagsData::new(), get(&values, *x));
+                    let ins = b.ins();
+                    let r = match op {
+                        ir::FUnOp::Neg => ins.fneg(x),
+                        ir::FUnOp::Abs => ins.fabs(x),
+                        ir::FUnOp::Sqrt => ins.sqrt(x),
+                        ir::FUnOp::Floor => ins.floor(x),
+                        ir::FUnOp::Ceil => ins.ceil(x),
+                        ir::FUnOp::Trunc => ins.trunc(x),
+                        ir::FUnOp::Nearest => ins.nearest(x),
+                    };
+                    vec![b.ins().bitcast(clif_type(ft.bits_type()), MemFlagsData::new(), r)]
+                }
+                ir::Op::FCmp(c, ft, x, y) => {
+                    let t = float_type(*ft);
+                    let x = b.ins().bitcast(t, MemFlagsData::new(), get(&values, *x));
+                    let y = b.ins().bitcast(t, MemFlagsData::new(), get(&values, *y));
+                    let cc = match c {
+                        ir::FCmp::Eq => FloatCC::Equal,
+                        ir::FCmp::Ne => FloatCC::NotEqual,
+                        ir::FCmp::Lt => FloatCC::LessThan,
+                        ir::FCmp::Le => FloatCC::LessThanOrEqual,
+                        ir::FCmp::Gt => FloatCC::GreaterThan,
+                        ir::FCmp::Ge => FloatCC::GreaterThanOrEqual,
+                        ir::FCmp::Uno => FloatCC::Unordered,
+                    };
+                    vec![b.ins().fcmp(cc, x, y)]
+                }
+                ir::Op::FToInt { from, to, signed, v } => {
+                    let x = b.ins().bitcast(float_type(*from), MemFlagsData::new(), get(&values, *v));
+                    vec![float_to_int(&mut b, x, *to, *signed)]
+                }
+                ir::Op::IntToF { to, signed, v } => {
+                    let mut x = get(&values, *v);
+                    // Cranelift converts from 32 and 64 bits.
+                    if b.func.dfg.value_type(x).bits() < 32 {
+                        x = if *signed { b.ins().sextend(types::I32, x) } else { b.ins().uextend(types::I32, x) };
+                    }
+                    let t = float_type(*to);
+                    let f = if *signed { b.ins().fcvt_from_sint(t, x) } else { b.ins().fcvt_from_uint(t, x) };
+                    vec![b.ins().bitcast(clif_type(to.bits_type()), MemFlagsData::new(), f)]
+                }
+                ir::Op::FConvert { from, to, v } => {
+                    let x = b.ins().bitcast(float_type(*from), MemFlagsData::new(), get(&values, *v));
+                    let t = float_type(*to);
+                    let f = if t.bits() > float_type(*from).bits() {
+                        b.ins().fpromote(t, x)
+                    } else {
+                        b.ins().fdemote(t, x)
+                    };
+                    vec![b.ins().bitcast(clif_type(to.bits_type()), MemFlagsData::new(), f)]
                 }
             };
             assert_eq!(results.len(), inst.results.len(), "verified IR: result counts match");
@@ -290,6 +446,7 @@ fn lower(
         match block.term.as_ref().expect("verified IR: every block is terminated") {
             ir::Terminator::Return(vs) => {
                 let vs: Vec<clif::Value> = vs.iter().map(|&v| get(&values, v)).collect();
+                let vs = abi_values(&mut b, &func.sig.returns, &vs, true);
                 b.ins().return_(&vs);
             }
             ir::Terminator::Jump(t) => {
@@ -314,6 +471,129 @@ fn lower(
 
     b.seal_all_blocks();
     b.finalize(obj.target_config());
+}
+
+/// 128-bit division and remainder. Cranelift has no 128-bit divide, and
+/// compiler-builtins' `__udivti3` passes `i128` differently on each OS, so
+/// Athrad divides inline, one bit at a time. Division by zero and
+/// `MIN / -1` never get here: MIR checks them first.
+fn div128(b: &mut FunctionBuilder, op: ir::BinOp, n: clif::Value, d: clif::Value) -> clif::Value {
+    let signed = matches!(op, ir::BinOp::SDiv | ir::BinOp::SRem);
+    let zero = b.ins().iconst(types::I64, 0);
+    let zero = b.ins().uextend(types::I128, zero);
+    let (un, ud, n_neg, d_neg) = if signed {
+        let n_neg = b.ins().icmp(IntCC::SignedLessThan, n, zero);
+        let d_neg = b.ins().icmp(IntCC::SignedLessThan, d, zero);
+        let nn = b.ins().ineg(n);
+        let nd = b.ins().ineg(d);
+        let un = b.ins().select(n_neg, nn, n);
+        let ud = b.ins().select(d_neg, nd, d);
+        (un, ud, Some(n_neg), Some(d_neg))
+    } else {
+        (n, d, None, None)
+    };
+
+    let header = b.create_block();
+    let body = b.create_block();
+    let exit = b.create_block();
+    for blk in [header, exit] {
+        if blk == header {
+            b.append_block_param(header, types::I32);
+        }
+        b.append_block_param(blk, types::I128);
+        b.append_block_param(blk, types::I128);
+    }
+    let start = b.ins().iconst(types::I32, 127);
+    b.ins().jump(header, &[BlockArg::Value(start), BlockArg::Value(zero), BlockArg::Value(zero)]);
+
+    b.switch_to_block(header);
+    let p = b.block_params(header).to_vec();
+    let (i, q, r) = (p[0], p[1], p[2]);
+    let more = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, i, 0);
+    b.ins().brif(more, body, &[], exit, &[BlockArg::Value(q), BlockArg::Value(r)]);
+
+    b.switch_to_block(body);
+    let i128_i = b.ins().uextend(types::I128, i);
+    let shifted = b.ins().ushr(un, i128_i);
+    let one = b.ins().iconst(types::I64, 1);
+    let one = b.ins().uextend(types::I128, one);
+    let bit = b.ins().band(shifted, one);
+    let r2 = b.ins().ishl_imm_u(r, 1);
+    let r2 = b.ins().bor(r2, bit);
+    let fits = b.ins().icmp(IntCC::UnsignedGreaterThanOrEqual, r2, ud);
+    let sub = b.ins().isub(r2, ud);
+    let r3 = b.ins().select(fits, sub, r2);
+    let qbit = b.ins().ishl(one, i128_i);
+    let qset = b.ins().bor(q, qbit);
+    let q2 = b.ins().select(fits, qset, q);
+    let i2 = b.ins().iadd_imm_s(i, -1);
+    b.ins().jump(header, &[BlockArg::Value(i2), BlockArg::Value(q2), BlockArg::Value(r3)]);
+
+    b.switch_to_block(exit);
+    let p = b.block_params(exit).to_vec();
+    let (q, r) = (p[0], p[1]);
+    match (op, n_neg, d_neg) {
+        (ir::BinOp::UDiv, ..) => q,
+        (ir::BinOp::URem, ..) => r,
+        (ir::BinOp::SDiv, Some(nn), Some(dn)) => {
+            let neg = b.ins().bxor(nn, dn);
+            let nq = b.ins().ineg(q);
+            b.ins().select(neg, nq, q)
+        }
+        (_, Some(nn), _) => {
+            let nr = b.ins().ineg(r);
+            b.ins().select(nn, nr, r)
+        }
+        _ => unreachable!("a division"),
+    }
+}
+
+/// 128-bit add and subtract with an overflow flag, from the sign and carry
+/// rules, for the ones Cranelift does not lower at 128 bits.
+fn addsub128_overflow(
+    b: &mut FunctionBuilder,
+    op: ir::OverflowOp,
+    signed: bool,
+    x: clif::Value,
+    y: clif::Value,
+) -> (clif::Value, clif::Value) {
+    let add = op == ir::OverflowOp::Add;
+    let r = if add { b.ins().iadd(x, y) } else { b.ins().isub(x, y) };
+    let of = if !signed {
+        if add { b.ins().icmp(IntCC::UnsignedLessThan, r, x) } else { b.ins().icmp(IntCC::UnsignedLessThan, x, y) }
+    } else {
+        // Overflow when the result's sign differs from what the operands'
+        // signs allow.
+        let a = b.ins().bxor(x, r);
+        let c = if add { b.ins().bxor(y, r) } else { b.ins().bxor(x, y) };
+        let both = b.ins().band(a, c);
+        let zero = b.ins().iconst(types::I64, 0);
+        let zero = b.ins().uextend(types::I128, zero);
+        b.ins().icmp(IntCC::SignedLessThan, both, zero)
+    };
+    (r, of)
+}
+
+/// Rust's float-to-integer `as`: toward zero, saturating at the type's
+/// bounds, NaN to 0. Cranelift saturates to 32 and 64 bits; narrower types
+/// go through 32 bits and a clamp.
+fn float_to_int(b: &mut FunctionBuilder, x: clif::Value, to: ir::Type, signed: bool) -> clif::Value {
+    let bits = to.bits();
+    if bits >= 32 {
+        let t = clif_type(to);
+        return if signed { b.ins().fcvt_to_sint_sat(t, x) } else { b.ins().fcvt_to_uint_sat(t, x) };
+    }
+    let wide = if signed { b.ins().fcvt_to_sint_sat(types::I32, x) } else { b.ins().fcvt_to_uint_sat(types::I32, x) };
+    let (lo, hi) = if signed { (-(1i64 << (bits - 1)), (1i64 << (bits - 1)) - 1) } else { (0, (1i64 << bits) - 1) };
+    let lo = b.ins().iconst(types::I32, lo & 0xffff_ffff);
+    let hi = b.ins().iconst(types::I32, hi);
+    let clamped = if signed {
+        let v = b.ins().smax(wide, lo);
+        b.ins().smin(v, hi)
+    } else {
+        b.ins().umin(wide, hi)
+    };
+    b.ins().ireduce(clif_type(to), clamped)
 }
 
 fn iconst(b: &mut FunctionBuilder, ty: ir::Type, n: i128) -> clif::Value {

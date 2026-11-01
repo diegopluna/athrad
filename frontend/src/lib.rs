@@ -100,8 +100,14 @@ fn lower_crate(tcx: TyCtxt<'_>) -> Result<Output> {
     }
     let mut m = ModCx::new(tcx);
     let parts = tcx.collect_and_partition_mono_items(());
+    // rustc may copy an inline item into several codegen units; Athrad makes
+    // one object, so it lowers each item once.
+    let mut seen = std::collections::HashSet::new();
     for cgu in parts.codegen_units {
         for (item, data) in cgu.items_in_deterministic_order(tcx) {
+            if !seen.insert(item) {
+                continue;
+            }
             let linkage = match (data.linkage, data.visibility) {
                 (RLinkage::Internal, _) => ir::Linkage::Local,
                 (RLinkage::External, Visibility::Hidden) => ir::Linkage::Hidden,
@@ -115,6 +121,8 @@ fn lower_crate(tcx: TyCtxt<'_>) -> Result<Output> {
             }
         }
     }
+    let vtables = std::mem::take(&mut m.vtables);
+    m.skippable.finish(tcx, &vtables).map_err(unsupported)?;
     entry(&mut m)?;
     allocator_shim(&mut m);
     let link = link_inputs(tcx)?;
@@ -204,7 +212,8 @@ fn link_inputs(tcx: TyCtxt<'_>) -> Result<link::Inputs> {
     let formats = info.dependency_formats.get(&CrateType::Executable).expect("an executable's dependency formats");
     let mut inputs = link::Inputs::default();
     let sess = tcx.sess;
-    let add_libs = |inputs: &mut link::Inputs, libs: &[rustc_codegen_ssa::NativeLib], statics: bool| -> Result<()> {
+    // `upstream`: the libraries of an rlib, rather than of the crate being built.
+    let add_libs = |inputs: &mut link::Inputs, libs: &[rustc_codegen_ssa::NativeLib], upstream: bool| -> Result<()> {
         for lib in libs {
             if let Some(cfg) = &lib.cfg
                 && !rustc_attr_parsing::eval_config_entry(sess, cfg).as_bool()
@@ -212,11 +221,14 @@ fn link_inputs(tcx: TyCtxt<'_>) -> Result<link::Inputs> {
                 continue;
             }
             let kind = match lib.kind {
-                NativeLibKind::Static { bundle: Some(false), .. } if statics => link::LibKind::Static,
+                NativeLibKind::Static { bundle: Some(false), .. } => link::LibKind::Static,
                 // Bundled into the rlib already.
                 NativeLibKind::Static { .. } => continue,
                 NativeLibKind::Dylib { .. } | NativeLibKind::Unspecified => link::LibKind::Dylib,
                 NativeLibKind::Framework { .. } => link::LibKind::Framework,
+                // On Windows, rustc put the import library for an rlib's
+                // raw-dylib imports into the rlib itself (std's do this).
+                NativeLibKind::RawDylib { .. } if upstream && sess.target.is_like_windows => continue,
                 NativeLibKind::RawDylib { .. } => return Err(unsupported("`raw-dylib` libraries")),
                 NativeLibKind::LinkArg => return Err(unsupported("`link-arg` libraries")),
                 NativeLibKind::WasmImportModule => continue,
@@ -228,7 +240,7 @@ fn link_inputs(tcx: TyCtxt<'_>) -> Result<link::Inputs> {
         }
         Ok(())
     };
-    add_libs(&mut inputs, &info.used_libraries, true)?;
+    add_libs(&mut inputs, &info.used_libraries, false)?;
     for &cnum in &info.used_crates {
         match formats[cnum] {
             DepLinkage::Static => {

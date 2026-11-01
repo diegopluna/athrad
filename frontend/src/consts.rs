@@ -7,7 +7,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir::interpret::{AllocId, GlobalAlloc, read_target_uint};
 use rustc_middle::ty::layout::FnAbiOf;
-use rustc_middle::ty::{self, Instance, TyCtxt};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 
 use crate::cx::{Cx, signature};
 use crate::{Result, unsupported};
@@ -24,6 +24,9 @@ pub(crate) struct ModCx<'tcx> {
     allocs: HashMap<AllocId, String>,
     /// Which drops a panic may skip; see `unwind.rs`.
     pub(crate) skippable: crate::unwind::Skippable<'tcx>,
+    /// The concrete type and principal trait of every vtable the program
+    /// builds.
+    pub(crate) vtables: Vec<(Ty<'tcx>, Option<DefId>)>,
 }
 
 /// What an address constant points at.
@@ -42,6 +45,7 @@ impl<'tcx> ModCx<'tcx> {
             datas: Vec::new(),
             allocs: HashMap::new(),
             skippable: Default::default(),
+            vtables: Vec::new(),
         }
     }
 
@@ -89,6 +93,7 @@ impl<'tcx> ModCx<'tcx> {
             GlobalAlloc::Memory(_) => Addr::Symbol(self.alloc_symbol(alloc_id)?, 0),
             GlobalAlloc::Function { instance } => Addr::Symbol(self.func_symbol(instance)?.0, 0),
             GlobalAlloc::VTable(ty, dyn_ty) => {
+                self.vtables.push((ty, dyn_ty.principal_def_id()));
                 let principal = dyn_ty.principal().map(|p| self.tcx.instantiate_bound_regions_with_erased(p));
                 let vtable = self.tcx.vtable_allocation((ty, principal));
                 Addr::Symbol(self.alloc_symbol(vtable)?, 0)
