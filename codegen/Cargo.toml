@@ -1,0 +1,21 @@
+[package]
+name = "codegen"
+description = "Lower Athrad IR to machine code through Cranelift."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ir.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+cranelift-object.workspace = true
+object.workspace = true
+
+[lints]
+workspace = true

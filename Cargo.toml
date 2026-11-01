@@ -1,0 +1,28 @@
+[workspace]
+resolver = "3"
+members = ["ir", "codegen", "link", "oracle", "athrad"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+ir = { path = "ir" }
+codegen = { path = "codegen" }
+link = { path = "link" }
+athrad = { path = "athrad" }
+anyhow = "1"
+cc = "1.10"
+cranelift-codegen = "0.137.1"
+cranelift-frontend = "0.137.1"
+cranelift-module = "0.137.1"
+cranelift-native = "0.137.1"
+cranelift-object = "0.137.1"
+object = { version = "0.40", default-features = false, features = ["write"] }
+target-lexicon = "0.13"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

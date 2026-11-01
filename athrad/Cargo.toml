@@ -1,0 +1,17 @@
+[package]
+name = "athrad"
+description = "A dev compiler for ordinary Rust: rustc's answer, faster in the edit loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+codegen.workspace = true
+ir.workspace = true
+link.workspace = true
+
+[lints]
+workspace = true

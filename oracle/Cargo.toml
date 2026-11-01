@@ -1,0 +1,17 @@
+[package]
+name = "oracle"
+description = "Compile a program with rustc and with Athrad, run both, fail if they differ."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+athrad.workspace = true
+ir.workspace = true
+link.workspace = true
+
+[lints]
+workspace = true
