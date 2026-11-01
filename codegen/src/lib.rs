@@ -5,7 +5,7 @@
 //! renaming. The module must have passed [`ir::verify`]; this crate panics on
 //! IR the verifier rejects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cranelift_codegen::Context;
@@ -17,13 +17,31 @@ use cranelift_codegen::ir::{
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
+mod cache;
 mod unwind;
+
+pub use cache::{Cache, Stats};
 
 /// Compile `module` for the host into an object named `name`.
 pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<'static>> {
+    Ok(compile_cached(module, name, &mut Cache::in_memory())?.0)
+}
+
+/// Like [`compile`], taking each function's machine code from `cache` when
+/// its key is there, and adding the ones that are not.
+pub fn compile_cached(
+    module: &ir::Module,
+    name: &str,
+    cache: &mut Cache,
+) -> Result<(object::write::Object<'static>, Stats)> {
+    cache.begin();
+    let mut stats = Stats::default();
+    // Module-wide checks every time; a function's own only when its code is
+    // not cached, since a hit means this very IR was checked before.
+    let verifier = ir::Verifier::new(module).context("invalid IR")?;
     let isa = host_isa()?;
     let builder = ObjectBuilder::new(isa.clone(), name, cranelift_module::default_libcall_names())?;
     let mut obj = ObjectModule::new(builder);
@@ -80,26 +98,119 @@ pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<
         sigs.insert(&func.name, &func.sig);
     }
 
+    let imported: HashSet<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
+    let symbol_kind = |name: &str| match (ids.get(name), sigs.get(name)) {
+        (Some(Id::Func(_)), Some(sig)) => cache::SymbolKind::Func { import: imported.contains(name), sig },
+        (Some(_), _) => cache::SymbolKind::Data { import: imported.contains(name) },
+        (None, _) => cache::SymbolKind::Missing,
+    };
+    let names: HashMap<u32, &str> = ids
+        .iter()
+        .filter_map(|(&n, id)| match id {
+            Id::Func(f) => Some((f.as_u32(), n)),
+            Id::Data(_) => None,
+        })
+        .collect();
+    let data_names: HashMap<u32, &str> = ids
+        .iter()
+        .filter_map(|(&n, id)| match id {
+            Id::Data(d) => Some((d.as_u32(), n)),
+            Id::Func(_) => None,
+        })
+        .collect();
+
     let mut ctx = obj.make_context();
     let mut fb_ctx = FunctionBuilderContext::new();
     let mut unwind_entries = Vec::new();
     for func in &module.functions {
-        ctx.func.signature = signature(&obj, &func.sig);
-        lower(&mut obj, &ids, &sigs, func, &mut ctx, &mut fb_ctx);
         let Id::Func(id) = ids[func.name.as_str()] else { unreachable!() };
-        obj.define_function(id, &mut ctx)
+        let key = cache::key(&*isa, func, symbol_kind);
+        let entry = match cache.get(&key) {
+            Some(entry) => {
+                stats.hits += 1;
+                entry
+            }
+            None => {
+                stats.misses += 1;
+                verifier.function(func).context("invalid IR")?;
+                if let Some(v) = std::env::var_os("ATHRAD_SHOW_MISSES") {
+                    eprintln!("athrad: compiling {}", func.name);
+                    if v == "ir" {
+                        eprintln!("{func}");
+                    }
+                }
+                ctx.func.signature = signature(&obj, &func.sig);
+                lower(&mut obj, &ids, &sigs, func, &mut ctx, &mut fb_ctx);
+                let entry = compile_one(&*isa, &mut ctx, &names, &data_names)
+                    .with_context(|| format!("compiling fn {}", func.name))?;
+                obj.clear_context(&mut ctx);
+                cache.insert(key, &entry)?;
+                entry
+            }
+        };
+        let relocs: Vec<ModuleReloc> = entry
+            .relocs
+            .iter()
+            .map(|r| ModuleReloc {
+                offset: r.offset,
+                kind: r.kind,
+                addend: r.addend,
+                name: match &r.target {
+                    cache::Target::Func(n) => match ids[n.as_str()] {
+                        Id::Func(f) => ModuleRelocTarget::from(f),
+                        Id::Data(_) => unreachable!("cached code calls `{n}` as a function"),
+                    },
+                    cache::Target::Data(n) => match ids[n.as_str()] {
+                        Id::Data(d) => ModuleRelocTarget::from(d),
+                        Id::Func(_) => unreachable!("cached code reads `{n}` as data"),
+                    },
+                    cache::Target::LibCall(l) => ModuleRelocTarget::LibCall(*l),
+                    cache::Target::Known(k) => ModuleRelocTarget::KnownSymbol(*k),
+                    cache::Target::SelfOffset(o) => ModuleRelocTarget::FunctionOffset(id, *o),
+                },
+            })
+            .collect();
+        obj.define_function_bytes(id, entry.align, &entry.code, &relocs)
             .map_err(|e| anyhow!("{e:?}"))
-            .with_context(|| format!("compiling fn {}", func.name))?;
-        let code = ctx.compiled_code().expect("defined");
-        if let Some(info) = code.create_unwind_info(obj.isa())? {
-            unwind_entries.push(unwind::Entry { func: id, info, size: code.code_info().total_size });
+            .with_context(|| format!("defining fn {}", func.name))?;
+        if let Some(info) = entry.unwind {
+            unwind_entries.push(unwind::Entry { func: id, info, size: entry.code.len() as u32 });
         }
-        obj.clear_context(&mut ctx);
     }
 
     let mut product = obj.finish();
     unwind::emit(&*isa, &mut product, unwind_entries)?;
-    Ok(product.object)
+    Ok((product.object, stats))
+}
+
+/// Compile the function in `ctx` to a cache entry: its bytes, its
+/// relocations with symbols by name, and its unwind info.
+fn compile_one(
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
+    ctx: &mut Context,
+    names: &HashMap<u32, &str>,
+    data_names: &HashMap<u32, &str>,
+) -> Result<cache::Entry> {
+    let code = ctx
+        .compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
+        .map_err(|e| anyhow!("{:?}", e.inner))?;
+    let align = u64::from(code.buffer.min_alignment);
+    let unwind = code.create_unwind_info(isa)?;
+    let code = ctx.compiled_code().expect("compiled");
+    let mut relocs = Vec::new();
+    for r in code.buffer.relocs() {
+        let m = ModuleReloc::from_mach_reloc(r, &ctx.func, FuncId::from_u32(0));
+        let target = match m.name {
+            ModuleRelocTarget::User { namespace: 0, index } => cache::Target::Func(names[&index].to_owned()),
+            ModuleRelocTarget::User { namespace: 1, index } => cache::Target::Data(data_names[&index].to_owned()),
+            ModuleRelocTarget::User { namespace, .. } => bail!("relocation in namespace {namespace}"),
+            ModuleRelocTarget::LibCall(l) => cache::Target::LibCall(l),
+            ModuleRelocTarget::KnownSymbol(k) => cache::Target::Known(k),
+            ModuleRelocTarget::FunctionOffset(_, o) => cache::Target::SelfOffset(o),
+        };
+        relocs.push(cache::CachedReloc { offset: m.offset, kind: m.kind, target, addend: m.addend });
+    }
+    Ok(cache::Entry { align, code: code.buffer.data().to_vec(), relocs, unwind })
 }
 
 #[derive(Clone, Copy)]

@@ -132,6 +132,24 @@ pub struct HostCc {
     args: Vec<OsString>,
     envs: Vec<(OsString, OsString)>,
     msvc: bool,
+    /// The linker command the driver would run, from [`HostCc::resolve`].
+    direct: Option<DirectLink>,
+}
+
+/// The command a C compiler driver runs to link, with the places for the
+/// output and the inputs marked. Running it directly skips the driver's own
+/// start-up and its search for the SDK and the C runtime, every link.
+#[derive(Clone, Debug)]
+struct DirectLink {
+    program: OsString,
+    args: Vec<Slot>,
+}
+
+#[derive(Clone, Debug)]
+enum Slot {
+    Arg(OsString),
+    Output,
+    Inputs,
 }
 
 impl HostCc {
@@ -149,7 +167,7 @@ impl HostCc {
             // The `cc` crate's probes take longer than a link (48 ms on macOS)
             // and, for the host, only find what this finds without them.
             let (program, args) = unix_compiler(target, |k| std::env::var_os(k));
-            return Ok(HostCc { program, args, envs: Vec::new(), msvc: false });
+            return Ok(HostCc { program, args, envs: Vec::new(), msvc: false, direct: None });
         }
         let tool = cc::Build::new()
             .target(target)
@@ -166,7 +184,53 @@ impl HostCc {
 
     fn from_tool(tool: &cc::Tool, msvc: bool) -> Self {
         let envs = tool.get_envs().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
-        HostCc { program: tool.path().into(), args: Vec::new(), envs, msvc }
+        HostCc { program: tool.path().into(), args: Vec::new(), envs, msvc, direct: None }
+    }
+
+    /// Ask the driver once which linker command it runs, and run that
+    /// directly from now on. Worth it for a process that links again and
+    /// again (`athrad watch`): on macOS the driver is 11 ms of each 37 ms
+    /// link. Leaves the driver in place when its answer cannot be used.
+    /// A no-op on MSVC, where Athrad runs `link.exe` itself.
+    pub fn resolve(&mut self) {
+        if self.msvc || self.direct.is_some() {
+            return;
+        }
+        self.direct = self.ask_driver();
+    }
+
+    fn ask_driver(&self) -> Option<DirectLink> {
+        let dir = std::env::temp_dir().join(format!("athrad-link-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok()?;
+        // The driver wants its inputs to exist, not to be objects.
+        let input = dir.join("athrad-probe-input.o");
+        let output = dir.join("athrad-probe-output");
+        std::fs::write(&input, b"").ok()?;
+        let out = self.command().arg("-###").arg("-o").arg(&output).arg(&input).output().ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = out?;
+        if !out.status.success() {
+            return None;
+        }
+        // The last line is the linker (or gcc's `collect2`, which runs it).
+        let text = String::from_utf8(out.stderr).ok()?;
+        let line = text.lines().rev().find(|l| l.trim_start().starts_with('"'))?;
+        let words = split_quoted(line)?;
+        let (input, output) = (input.to_str()?, output.to_str()?);
+        let (mut saw_in, mut saw_out) = (0, 0);
+        let mut args = Vec::new();
+        for w in &words[1..] {
+            args.push(if w == input {
+                saw_in += 1;
+                Slot::Inputs
+            } else if w == output {
+                saw_out += 1;
+                Slot::Output
+            } else {
+                Slot::Arg(w.into())
+            });
+        }
+        (saw_in == 1 && saw_out == 1).then(|| DirectLink { program: words[0].clone().into(), args })
     }
 
     fn command(&self) -> Command {
@@ -175,6 +239,40 @@ impl HostCc {
         cmd.envs(self.envs.iter().map(|(k, v)| (k, v)));
         cmd
     }
+}
+
+/// Split a command line as clang's and gcc's `-###` print it: words in
+/// double quotes, with backslash escapes inside them, or bare words.
+fn split_quoted(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut chars = line.trim().chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c == ' ' {
+            chars.next();
+            continue;
+        }
+        let mut w = String::new();
+        if c == '"' {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => w.push(chars.next()?),
+                    c => w.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == ' ' {
+                    break;
+                }
+                w.push(c);
+                chars.next();
+            }
+        }
+        words.push(w);
+    }
+    (!words.is_empty()).then_some(words)
 }
 
 /// The C compiler for a host `target` on Unix, as the `cc` crate picks it:
@@ -211,14 +309,30 @@ impl Linker for HostCc {
             // The dynamic C runtime, as rustc links it by default.
             cmd.args(["msvcrt.lib", "vcruntime.lib", "ucrt.lib", "kernel32.lib"]);
         } else {
-            cmd.arg("-o").arg(output);
-            cmd.args(&inputs.objects).args(&inputs.archives);
+            let mut ins: Vec<OsString> = Vec::new();
+            ins.extend(inputs.objects.iter().chain(&inputs.archives).map(|p| p.clone().into_os_string()));
             for lib in &inputs.libs {
                 match (lib.kind, lib.verbatim) {
-                    (LibKind::Framework, _) => cmd.args(["-framework", &lib.name]),
-                    (_, true) => cmd.arg(format!("-l:{}", lib.name)),
-                    (_, false) => cmd.arg(format!("-l{}", lib.name)),
+                    (LibKind::Framework, _) => ins.extend(["-framework".into(), lib.name.clone().into()]),
+                    (_, true) => ins.push(format!("-l:{}", lib.name).into()),
+                    (_, false) => ins.push(format!("-l{}", lib.name).into()),
                 };
+            }
+            match &self.direct {
+                Some(direct) => {
+                    cmd = Command::new(&direct.program);
+                    cmd.envs(self.envs.iter().map(|(k, v)| (k, v)));
+                    for slot in &direct.args {
+                        match slot {
+                            Slot::Arg(a) => cmd.arg(a),
+                            Slot::Output => cmd.arg(output),
+                            Slot::Inputs => cmd.args(&ins),
+                        };
+                    }
+                }
+                None => {
+                    cmd.arg("-o").arg(output).args(&ins);
+                }
             }
         }
         let program = Path::new(&self.program).display();
@@ -238,6 +352,13 @@ impl Linker for HostCc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_driver_command_lines() {
+        let line = r#" "/usr/bin/ld" "-o" "a b" "x\"y" -lc"#;
+        assert_eq!(split_quoted(line).unwrap(), ["/usr/bin/ld", "-o", "a b", "x\"y", "-lc"]);
+        assert_eq!(split_quoted(r#""unterminated"#), None);
+    }
 
     #[test]
     fn formats_for_the_three_hosts() {

@@ -1,7 +1,7 @@
 //! Checks a module before codegen sees it. Codegen may assume a verified
 //! module and panic on anything this lets through.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::{BlockId, Function, Inst, Module, Op, PTR, Symbol, Target, Terminator, Type, Value};
@@ -24,45 +24,86 @@ impl fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 pub fn verify(module: &Module) -> Result<(), VerifyError> {
-    let module_err = |message: String| VerifyError { function: None, message };
-    let mut names = HashSet::new();
-    let all = module
-        .imports
-        .iter()
-        .map(|e| &e.name)
-        .chain(module.functions.iter().map(|f| &f.name))
-        .chain(module.data.iter().map(|d| &d.name));
-    for name in all {
-        if name.is_empty() {
-            return Err(module_err("empty symbol name".into()));
-        }
-        if !names.insert(name) {
-            return Err(module_err(format!("symbol `{name}` is defined twice")));
-        }
-    }
-    for d in &module.data {
-        if !d.align.is_power_of_two() {
-            return Err(module_err(format!("data `{}` has alignment {}", d.name, d.align)));
-        }
-        for r in &d.relocs {
-            if r.offset as usize + 8 > d.bytes.len() {
-                return Err(module_err(format!("data `{}` has a relocation past its end", d.name)));
-            }
-            if module.symbol(&r.symbol).is_none() {
-                return Err(module_err(format!("data `{}` refers to unknown symbol `{}`", d.name, r.symbol)));
-            }
-        }
-    }
+    let v = Verifier::new(module)?;
     for func in &module.functions {
-        Checker { module, func }
-            .check()
-            .map_err(|message| VerifyError { function: Some(func.name.clone()), message })?;
+        v.function(func)?;
     }
     Ok(())
 }
 
+/// A module's symbols, checked; functions are checked one at a time, so a
+/// caller that knows a function is unchanged since it was last checked (its
+/// code is cached by its IR's hash) can skip it.
+pub struct Verifier<'a> {
+    symbols: HashMap<&'a str, Symbol<'a>>,
+}
+
+impl<'a> Verifier<'a> {
+    /// Check what is module-wide: symbol names, and data.
+    pub fn new(module: &'a Module) -> Result<Self, VerifyError> {
+        let module_err = |message: String| VerifyError { function: None, message };
+        let mut names = HashSet::new();
+        let all = module
+            .imports
+            .iter()
+            .map(|e| &e.name)
+            .chain(module.functions.iter().map(|f| &f.name))
+            .chain(module.data.iter().map(|d| &d.name));
+        for name in all {
+            if name.is_empty() {
+                return Err(module_err("empty symbol name".into()));
+            }
+            if !names.insert(name) {
+                return Err(module_err(format!("symbol `{name}` is defined twice")));
+            }
+        }
+        // Every symbol by name, once: looking each up in the module's lists
+        // would make verifying a big module quadratic.
+        let mut symbols: HashMap<&str, Symbol<'_>> = HashMap::new();
+        for i in &module.imports {
+            let sym = match &i.kind {
+                crate::ImportKind::Func(sig) => Symbol::Func(sig),
+                crate::ImportKind::Data => Symbol::Data,
+            };
+            symbols.insert(&i.name, sym);
+        }
+        for d in &module.data {
+            symbols.insert(&d.name, Symbol::Data);
+        }
+        for f in &module.functions {
+            symbols.insert(&f.name, Symbol::Func(&f.sig));
+        }
+        for d in &module.data {
+            if !d.align.is_power_of_two() {
+                return Err(module_err(format!("data `{}` has alignment {}", d.name, d.align)));
+            }
+            for r in &d.relocs {
+                if r.offset as usize + 8 > d.bytes.len() {
+                    return Err(module_err(format!("data `{}` has a relocation past its end", d.name)));
+                }
+                if !symbols.contains_key(r.symbol.as_str()) {
+                    return Err(module_err(format!("data `{}` refers to unknown symbol `{}`", d.name, r.symbol)));
+                }
+            }
+        }
+        Ok(Verifier { symbols })
+    }
+
+    /// Check one function of the module.
+    pub fn function(&self, func: &Function) -> Result<(), VerifyError> {
+        Checker { symbols: &self.symbols, func }
+            .check()
+            .map_err(|message| VerifyError { function: Some(func.name.clone()), message })
+    }
+
+    /// What `name` refers to in the module.
+    pub fn symbol(&self, name: &str) -> Option<Symbol<'a>> {
+        self.symbols.get(name).copied()
+    }
+}
+
 struct Checker<'a> {
-    module: &'a Module,
+    symbols: &'a HashMap<&'a str, Symbol<'a>>,
     func: &'a Function,
 }
 
@@ -95,7 +136,7 @@ impl Checker<'_> {
         }
 
         let preds = self.predecessors()?;
-        let doms = dominators(func.blocks.len(), &preds);
+        let doms = Dominators::new(func.blocks.len(), &preds);
 
         for (b, block) in func.blocks.iter().enumerate() {
             let id = BlockId(b as u32);
@@ -103,7 +144,7 @@ impl Checker<'_> {
             let available = |v: Value, local: &HashSet<Value>| -> Result<Type, String> {
                 let ty = self.ty(v)?;
                 let def = defined_in[v.0 as usize].ok_or_else(|| format!("{v} is never defined"))?;
-                let ok = if def == b { local.contains(&v) } else { doms[b].contains(&def) };
+                let ok = if def == b { local.contains(&v) } else { doms.dominates(def, b) };
                 if ok { Ok(ty) } else { Err(format!("{v} is used in {id} where its definition does not dominate")) }
             };
             for inst in &block.insts {
@@ -232,7 +273,7 @@ impl Checker<'_> {
                 vec![PTR]
             }
             Op::SymbolAddr(name) => {
-                self.module.symbol(name).ok_or_else(|| format!("address of unknown symbol `{name}`"))?;
+                self.symbols.get(name.as_str()).ok_or_else(|| format!("address of unknown symbol `{name}`"))?;
                 vec![PTR]
             }
             Op::Load(ty, addr, _) => {
@@ -245,7 +286,7 @@ impl Checker<'_> {
                 vec![]
             }
             Op::Call(name, args) => {
-                let sig = match self.module.symbol(name) {
+                let sig = match self.symbols.get(name.as_str()).copied() {
                     Some(Symbol::Func(sig)) => sig,
                     Some(Symbol::Data) => return Err(format!("call to data symbol `{name}`")),
                     None => return Err(format!("call to unknown function `{name}`")),
@@ -293,30 +334,96 @@ fn successors(term: Option<&Terminator>) -> Vec<BlockId> {
     }
 }
 
-/// For each block, the set of blocks that dominate it (itself included).
-/// Unreachable blocks are dominated by everything, which is harmless: they
-/// never run, and Cranelift drops them.
-fn dominators(n: usize, preds: &[Vec<usize>]) -> Vec<HashSet<usize>> {
-    let all: HashSet<usize> = (0..n).collect();
-    let mut doms = vec![all; n];
-    doms[0] = HashSet::from([0]);
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for b in 1..n {
-            let mut new = preds[b]
-                .iter()
-                .map(|&p| doms[p].clone())
-                .reduce(|a, b| a.intersection(&b).copied().collect())
-                .unwrap_or_else(|| (0..n).collect());
-            new.insert(b);
-            if new != doms[b] {
-                doms[b] = new;
-                changed = true;
+/// Immediate dominators, by Cooper, Harvey, and Kennedy's "A Simple, Fast
+/// Dominance Algorithm". Unreachable blocks count as dominated by every
+/// block, which is harmless: they never run, and Cranelift drops them.
+struct Dominators {
+    /// Each reachable block's immediate dominator; the entry's is itself.
+    idom: Vec<Option<usize>>,
+}
+
+impl Dominators {
+    fn new(n: usize, preds: &[Vec<usize>]) -> Self {
+        // Reverse postorder from the entry, from the successor lists.
+        let mut succs = vec![Vec::new(); n];
+        for (b, ps) in preds.iter().enumerate() {
+            for &p in ps {
+                succs[p].push(b);
             }
         }
+        let mut order = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some((b, i)) = stack.pop() {
+            if let Some(&s) = succs[b].get(i) {
+                stack.push((b, i + 1));
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                order.push(b);
+            }
+        }
+        // `post[b]`: b's index in postorder.
+        let mut post = vec![usize::MAX; n];
+        for (i, &b) in order.iter().enumerate() {
+            post[b] = i;
+        }
+        let mut idom: Vec<Option<usize>> = vec![None; n];
+        idom[0] = Some(0);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &b in order.iter().rev().skip(1) {
+                let mut new: Option<usize> = None;
+                for &p in &preds[b] {
+                    if idom[p].is_none() {
+                        continue;
+                    }
+                    new = Some(match new {
+                        None => p,
+                        Some(mut x) => {
+                            let mut y = p;
+                            while x != y {
+                                while post[x] < post[y] {
+                                    x = idom[x].expect("processed");
+                                }
+                                while post[y] < post[x] {
+                                    y = idom[y].expect("processed");
+                                }
+                            }
+                            x
+                        }
+                    });
+                }
+                if new.is_some() && idom[b] != new {
+                    idom[b] = new;
+                    changed = true;
+                }
+            }
+        }
+        Dominators { idom }
     }
-    doms
+
+    /// Whether `a` dominates `b`.
+    fn dominates(&self, a: usize, b: usize) -> bool {
+        if self.idom[b].is_none() {
+            return true;
+        }
+        let mut x = b;
+        loop {
+            if x == a {
+                return true;
+            }
+            let up = self.idom[x].expect("reachable");
+            if up == x {
+                return false;
+            }
+            x = up;
+        }
+    }
 }
 
 #[cfg(test)]

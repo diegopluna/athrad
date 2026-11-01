@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::{BasicBlock, Body, TerminatorKind};
 use rustc_middle::ty::{self, Ty, TyCtxt};
+use serde::{Deserialize, Serialize};
 
 /// Standard types whose `Drop` frees a buffer of their type parameter
 /// without dropping any value in it.
@@ -86,36 +87,37 @@ impl<'tcx> Skippable<'tcx> {
         Ok(())
     }
 
-    /// Once every function is lowered: each trait object a cleanup would
-    /// drop must only ever hold types whose drop may be skipped. `vtables`
-    /// are the concrete types behind every vtable the program has.
-    pub(crate) fn finish(&mut self, tcx: TyCtxt<'tcx>, vtables: &[(Ty<'tcx>, Option<DefId>)]) -> Result<(), String> {
-        let dyn_drops = std::mem::take(&mut self.dyn_drops);
-        for (dyn_ty, at) in dyn_drops {
-            let ty::Dynamic(preds, ..) = dyn_ty.kind() else { continue };
-            let principal = preds.principal_def_id();
-            for &(concrete, vt_principal) in vtables {
-                if vt_principal != principal {
-                    continue;
-                }
-                let mut nested = Vec::new();
-                self.drop_of(tcx, concrete, &mut nested)
-                    .and_then(|()| match nested.first() {
-                        Some(d) => Err(format!("`{d}` inside it")),
-                        None => Ok(()),
-                    })
-                    .map_err(|why| {
-                        format!(
-                            "dropping `{dyn_ty}` while unwinding a panic, which may be a `{concrete}`: {why} ({at})"
-                        )
-                    })?;
-            }
+    /// What this codegen unit says about trait objects, for
+    /// [`check_trait_objects`] to decide once every unit is lowered (or
+    /// reused). `vtables` are the concrete type and principal trait of every
+    /// vtable the unit builds.
+    pub(crate) fn facts(&mut self, tcx: TyCtxt<'tcx>, vtables: &[(Ty<'tcx>, Option<DefId>)]) -> Facts {
+        let mut facts = Facts::default();
+        for &(concrete, principal) in vtables {
+            let mut nested = Vec::new();
+            let verdict = self.drop_of(tcx, concrete, &mut nested).and_then(|()| match nested.first() {
+                Some(d) => Err(format!("`{d}` inside it")),
+                None => Ok(()),
+            });
+            facts.vtables.push(VtableFact {
+                principal: principal.map(|p| def_path(tcx, p)),
+                concrete: concrete.to_string(),
+                why_not: verdict.err(),
+            });
         }
-        Ok(())
+        for (dyn_ty, at) in std::mem::take(&mut self.dyn_drops) {
+            let ty::Dynamic(preds, ..) = dyn_ty.kind() else { continue };
+            facts.dyn_drops.push(DynDropFact {
+                principal: preds.principal_def_id().map(|p| def_path(tcx, p)),
+                ty: dyn_ty.to_string(),
+                at,
+            });
+        }
+        facts
     }
 
     /// `Ok` when skipping the drop of a `ty` cannot be seen. Trait objects
-    /// are pushed to `dyns`, to be decided by [`Self::finish`].
+    /// are pushed to `dyns`, to be decided by [`check_trait_objects`].
     fn drop_of(&mut self, tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, dyns: &mut Vec<Ty<'tcx>>) -> Result<(), String> {
         if let Some(r) = self.cache.get(&ty) {
             return r.clone();
@@ -167,6 +169,47 @@ impl<'tcx> Skippable<'tcx> {
             _ => Err(format!("`{ty}` has a destructor Athrad cannot see through")),
         }
     }
+}
+
+/// What one codegen unit knows about trait objects and their drops.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct Facts {
+    vtables: Vec<VtableFact>,
+    dyn_drops: Vec<DynDropFact>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VtableFact {
+    principal: Option<String>,
+    concrete: String,
+    /// Why dropping a `concrete` may not be skipped, if it may not.
+    why_not: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DynDropFact {
+    principal: Option<String>,
+    ty: String,
+    at: String,
+}
+
+/// Each trait object some cleanup would drop must only ever hold types whose
+/// drop may be skipped, across every codegen unit's vtables.
+pub(crate) fn check_trait_objects(all: &[Facts]) -> Result<(), String> {
+    for d in all.iter().flat_map(|f| &f.dyn_drops) {
+        for v in all.iter().flat_map(|f| &f.vtables) {
+            if v.principal != d.principal {
+                continue;
+            }
+            if let Some(why) = &v.why_not {
+                return Err(format!(
+                    "dropping `{}` while unwinding a panic, which may be a `{}`: {why} ({})",
+                    d.ty, v.concrete, d.at
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `did` comes from the standard library. Until milestone 3 there

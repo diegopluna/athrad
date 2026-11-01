@@ -124,6 +124,78 @@ pub fn check_sources(name: &str, rustc_src: &Path, athrad_src: &Path, work_dir: 
     Ok(Agreement { rustc, athrad })
 }
 
+/// The `// edit: FROM => TO` lines of a program, in order. One edit may
+/// make several replacements at once, separated by ` ;; `, for a change
+/// that only compiles whole.
+pub fn edits(program: &Program) -> Result<Vec<Vec<(String, String)>>> {
+    let text = std::fs::read_to_string(&program.path)?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("// edit:") {
+            let mut edit = Vec::new();
+            for part in rest.split(" ;; ") {
+                let (from, to) = part.split_once("=>").with_context(|| format!("an edit without `=>`: {line}"))?;
+                edit.push((from.trim().to_owned(), to.trim().to_owned()));
+            }
+            out.push(edit);
+        }
+    }
+    Ok(out)
+}
+
+/// What [`check_edits`] saw Athrad reuse, over the rebuilds after edits.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Reuse {
+    pub builds: usize,
+    pub reused_units: usize,
+    pub cached_functions: usize,
+    pub compiled_functions: usize,
+}
+
+/// The edit loop under the oracle: build `program`, then make each of its
+/// [`edits`] in turn (each to the first line of code with its `FROM`), and
+/// rebuild with Athrad's caches warm from the build before. Every build must
+/// agree with `rustc`'s build of the same text.
+pub fn check_edits(program: &Program, work_dir: &Path) -> Result<Reuse> {
+    let name = &program.name;
+    let edits = edits(program)?;
+    let dir = work_dir.join(format!("{name}-edits"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src"))?;
+    let src = dir.join("src").join(format!("{name}.rs"));
+    let mut lines: Vec<String> = std::fs::read_to_string(&program.path)?.lines().map(str::to_owned).collect();
+    let mut caches = athrad::Caches { code: Default::default(), incremental: Some(dir.join("incr")) };
+    let mut reuse = Reuse::default();
+    for step in 0..=edits.len() {
+        if step > 0 {
+            for (from, to) in &edits[step - 1] {
+                let line = lines
+                    .iter_mut()
+                    .find(|l| !l.trim_start().starts_with("// edit:") && l.contains(from.as_str()))
+                    .with_context(|| format!("`{name}`: edit {step} finds no `{from}`"))?;
+                *line = line.replacen(from.as_str(), to, 1);
+            }
+        }
+        std::fs::write(&src, lines.join("\n") + "\n")?;
+        let rustc_exe = build_with_rustc(name, &src, &dir.join("rustc"))?;
+        let exe = dir.join("athrad").join(link::executable_name(name));
+        std::fs::create_dir_all(dir.join("athrad"))?;
+        let t = athrad::build_cached(&src, linker()?, &mut caches, &dir.join("work"), &exe)
+            .with_context(|| format!("athrad failed on `{name}` after edit {step}"))?;
+        if step > 0 {
+            reuse.builds += 1;
+            reuse.reused_units += t.reused_units;
+            reuse.cached_functions += t.cache.hits;
+            reuse.compiled_functions += t.cache.misses;
+        }
+        let (rustc, athrad) = (run(&rustc_exe)?, run(&exe)?);
+        if rustc != athrad {
+            bail!("`{name}` after edit {step}: Athrad disagrees with rustc\nrustc:\n{rustc}\nathrad:\n{athrad}");
+        }
+    }
+    Ok(reuse)
+}
+
 /// Compile with `rustc` as `cargo build` would for a debug binary.
 pub fn build_with_rustc(name: &str, source: &Path, dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
@@ -158,7 +230,7 @@ pub fn linker() -> Result<&'static link::HostCc> {
 /// Build with Athrad, in this process.
 pub fn build_with_athrad(name: &str, source: &Path, dir: &Path) -> Result<PathBuf> {
     let exe = dir.join(link::executable_name(name));
-    athrad::build(source, linker()?, dir, &exe).with_context(|| format!("athrad failed on `{name}`"))?;
+    athrad::build(source, linker()?, dir, &exe).map(drop).with_context(|| format!("athrad failed on `{name}`"))?;
     Ok(exe)
 }
 

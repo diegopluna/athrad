@@ -22,6 +22,7 @@ pub(crate) struct ModCx<'tcx> {
     /// Data symbols referred to that may live in another crate.
     datas: Vec<String>,
     allocs: HashMap<AllocId, String>,
+    writable_allocs: usize,
     /// Which drops a panic may skip; see `unwind.rs`.
     pub(crate) skippable: crate::unwind::Skippable<'tcx>,
     /// The concrete type and principal trait of every vtable the program
@@ -44,6 +45,7 @@ impl<'tcx> ModCx<'tcx> {
             funcs: HashMap::new(),
             datas: Vec::new(),
             allocs: HashMap::new(),
+            writable_allocs: 0,
             skippable: Default::default(),
             vtables: Vec::new(),
         }
@@ -104,17 +106,46 @@ impl<'tcx> ModCx<'tcx> {
     }
 
     /// The data symbol holding a memory allocation, defined on first use.
+    /// The symbol of a constant allocation. Its name comes from its contents,
+    /// so it stays the same from build to build whatever else changes, and
+    /// so do the functions that refer to it, which keeps their cached
+    /// machine code good. Equal immutable allocations share one symbol.
     fn alloc_symbol(&mut self, alloc_id: AllocId) -> Result<String> {
         if let Some(name) = self.allocs.get(&alloc_id) {
+            if name.is_empty() {
+                return Err(unsupported("constants that point at themselves"));
+            }
             return Ok(name.clone());
         }
-        let name = format!("__athrad_alloc_{}", self.allocs.len());
-        self.allocs.insert(alloc_id, name.clone());
         let GlobalAlloc::Memory(alloc) = self.tcx.global_alloc(alloc_id) else {
             unreachable!("only memory allocations get data symbols")
         };
-        let data = self.data_for(alloc.inner(), name.clone(), ir::Linkage::Local)?;
-        self.module.push_data(data);
+        // Marks the allocation as in progress, to catch a cycle.
+        self.allocs.insert(alloc_id, String::new());
+        let mut data = self.data_for(alloc.inner(), String::new(), ir::Linkage::Local)?;
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut h, data.align.to_le_bytes());
+        sha2::Digest::update(&mut h, &data.bytes);
+        for r in &data.relocs {
+            sha2::Digest::update(&mut h, r.offset.to_le_bytes());
+            sha2::Digest::update(&mut h, r.symbol.as_bytes());
+            sha2::Digest::update(&mut h, [0]);
+            sha2::Digest::update(&mut h, r.addend.to_le_bytes());
+        }
+        let digest = sha2::Digest::finalize(h);
+        let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+        let name = if data.writable {
+            // Each mutable allocation is its own, however alike.
+            self.writable_allocs += 1;
+            format!("__athrad_alloc_{hex}_{}", self.writable_allocs)
+        } else {
+            format!("__athrad_alloc_{hex}")
+        };
+        self.allocs.insert(alloc_id, name.clone());
+        if self.module.data.iter().all(|d| d.name != name) {
+            data.name = name.clone();
+            self.module.push_data(data);
+        }
         Ok(name)
     }
 

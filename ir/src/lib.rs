@@ -16,7 +16,7 @@ use std::fmt;
 
 mod verify;
 
-pub use verify::{VerifyError, verify};
+pub use verify::{Verifier, VerifyError, verify};
 
 /// An integer type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

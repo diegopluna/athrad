@@ -40,6 +40,27 @@ fn every_program() {
     assert!(failures.is_empty(), "{} failed:\n\n{}", failures.len(), failures.join("\n\n"));
 }
 
+/// The edit loop: each program with `// edit:` lines is rebuilt after each
+/// edit with warm caches, and must still agree with rustc. The caches must
+/// have been used, or the test proves nothing about them.
+#[test]
+fn edits_with_warm_caches() {
+    let mut checked = 0;
+    for program in oracle::programs().unwrap() {
+        if oracle::edits(&program).unwrap().is_empty() {
+            continue;
+        }
+        let reuse = oracle::check_edits(&program, work_dir()).unwrap_or_else(|e| panic!("{e:#}"));
+        assert!(
+            reuse.reused_units > 0 && reuse.cached_functions > 0,
+            "`{}`: the rebuilds reused nothing: {reuse:?}",
+            program.name
+        );
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
 /// Programs Athrad does not build yet. Rejecting one is fine; building one
 /// that disagrees with `rustc` is not. Each one Athrad now agrees on is
 /// listed, to be moved up into `oracle/programs`.
