@@ -96,15 +96,16 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-Milestones 0 and 1 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
+Milestones 0, 1, and 2 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
 
-`athrad FILE.rs [-o OUT]` builds a one-file binary crate as `rustc --edition 2024 FILE.rs` would, and the oracle checks 14 programs that way: arithmetic and overflow panics, loops and recursion, structs, enums and `match`, `Option`/`Result`, `Vec`, `String`, `Box`, sorting, iterators and closures, generics, trait objects, `f32`/`f64` with their edge cases, `i128`/`u128`, bounds-check and `unwrap`/`expect`/`panic!` panics, and `ExitCode`.
+`athrad FILE.rs [-o OUT]` builds a one-file binary crate as `rustc --edition 2024 FILE.rs` would, and the oracle checks 17 programs that way: arithmetic and overflow panics, loops and recursion, structs, enums and `match`, `Option`/`Result`, `Vec`, `String`, `Box`, sorting, iterators and closures, generics, trait objects, `f32`/`f64` with their edge cases, `i128`/`u128`, bounds-check and `unwrap`/`expect`/`panic!` panics, `ExitCode`, a generated 1,800-line program, and a series of edits.
 
 The pipeline:
 
 ```text
-.rs ─rustc 1.98.1 (rustc-dev, in-process)─▶ MIR ─frontend─▶ ir ─verify─▶ codegen (Cranelift) ─▶ object ─▶ cc / link.exe ─▶ exe
-                                                                          std's rlibs and system libraries ─┘
+.rs ─rustc 1.98.1 (rustc-dev, in-process; Athrad is its codegen backend)─▶ MIR per codegen unit
+    ─frontend─▶ ir ─verify, codegen (Cranelift)─▶ object per unit ─▶ cc / link.exe ─▶ exe
+                                         std's rlibs and system libraries ─┘
 ```
 
 * `rust-toolchain.toml` pins 1.98.1 with `rustc-dev`. `frontend` drives that `rustc` through `rustc_driver` (`#![feature(rustc_private)]`, which `.cargo/config.toml` allows on stable with `RUSTC_BOOTSTRAP=1` for this workspace only). `rustc` parses, type-checks, borrow-checks, and monomorphizes; Athrad lowers every mono item, writes the entry and allocator shims, and links against the real `std`. The oracle's `rustc` is the same compiler.
@@ -132,4 +133,30 @@ Whole-file builds, MacBook Pro (Apple Silicon), release `athrad`, median of 10, 
 | `floats.rs` | 89 ms | 105 ms |
 | `traits.rs` | 83 ms | 101 ms |
 
-Next is milestone 2: hash each function body, rebuild and relink only what changed, and measure that edit against `cargo build`.
+### Milestone 2: one edit, one function
+
+Done, and green on all three hosts. An edit is rebuilt through two caches:
+
+* **`rustc`'s incremental compilation, with Athrad as its codegen backend.** `frontend` wraps `rustc`'s own LLVM backend (so `cfg`s, target features, and the CPU are what `rustc` would use) and replaces its code generation: each codegen unit is lowered inside the unit's dep-graph task and becomes an object, which is registered as the unit's work product. A unit `rustc` marks green keeps its object and is not lowered at all. With incremental compilation on, Athrad asks for 16 units: `rustc`'s incremental default is a unit per module (67 for `heap.rs`), and each unit costs about a millisecond to check and link.
+* **Machine code per function.** `codegen::Cache` keys each function by a SHA-256 of its IR (not its linkage, which `rustc`'s partitioning moves around), the kind and signature of each symbol it references, the ISA and its flags, and a hash of the `ir` and `codegen` sources. A hit skips lowering to Cranelift and that function's verification. Constant allocations are named by their contents, so editing one function does not rename the constants of the others. In a unit that changed, only functions whose IR changed are compiled: editing `main` in `heap.rs` compiles one function.
+
+`athrad FILE.rs` keeps both caches next to the output, in `.athrad/STEM.cache` and `.athrad/STEM.incr/`. `athrad watch FILE.rs [-o OUT] [--run]` stays warm and rebuilds when the file's contents change. It uses the `Watcher` trait, backed by `notify` (`inotify`, `kqueue`, `ReadDirectoryChangesW`). It also asks the C compiler driver once for the linker command it would run, and runs that directly, which saves 11 ms per link on macOS. `ATHRAD_TIME=1` prints where a build's time went.
+
+The oracle checks the edit loop itself: a program with `// edit: FROM => TO` lines (`oracle/programs/edits.rs`: a constant, a function body, a struct's layout, a string, a new enum use, an early return) is rebuilt after each edit with warm caches, and every build must agree with `rustc`, and the caches must have been used. That test caught a real bug on its first run: the unit's item list was read outside its dep-graph task.
+
+**The number.** `scripts/edit_loop.py`: one literal in `main` flipped back and forth, median of 15, MacBook Pro (Apple Silicon), `cargo build` debug with incremental compilation, everything warm. `big.rs` is generated by `scripts/gen_big.py`: 1,800 lines, 7,373 functions after monomorphization.
+
+| Program | `cargo build` | `athrad` | `athrad watch` |
+|---|---|---|---|
+| `add.rs` | 137 ms | 79 ms | 70 ms |
+| `heap.rs` | 192 ms | 110 ms | 103 ms |
+| `traits.rs` | 164 ms | 99 ms | 92 ms |
+| `big.rs` | 267 ms | 176 ms | 158 ms |
+
+Where an edit's time goes now (`heap.rs`, `athrad`): `rustc` 40 ms (parsing, incremental type checking and MIR, marking units green), lowering 5 ms, code generation 1 ms, linking 37 ms. For `big.rs`: `rustc` 91 ms, lowering 9 ms, code generation 3 ms, linking 45 ms. Athrad's own work is now a few milliseconds; the rest is `rustc`'s frontend and the system linker.
+
+* Incremental compilation costs small programs about 15 ms over a whole rebuild with the function cache alone (`heap.rs` was 94 ms that way), and saves large ones much more (`big.rs` was 330 ms). It is always on in the `athrad` command; the oracle's plain builds run without it.
+* On macOS the linker's floor is 19 ms (`ld` on an empty program) and the driver adds 11 ms. A faster linker is the next lever, and rule 4's profile now says so. `rust-lld` cannot link on macOS 27: it cannot read the SDK's `libSystem.tbd`. Linking `std` as a dylib saved only 4 ms, so Athrad does not.
+* After the machine has been idle for a few hundred milliseconds, every build here (`cargo`'s, `rustc`'s, Athrad's) is slower: `heap.rs` in a warm `athrad watch` takes 66 ms back to back and about 85 ms with 400 ms between edits. The table is measured the way an edit happens, with pauses.
+
+Next is milestone 3: a crate with modules and `Cargo.toml`, then one plain library dependency.
