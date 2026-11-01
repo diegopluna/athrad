@@ -124,7 +124,7 @@ impl HostCc {
 
     fn command(&self) -> Command {
         let mut cmd = Command::new(self.tool.path());
-        for (k, v) in self.tool.env() {
+        for (k, v) in self.tool.get_envs() {
             cmd.env(k, v);
         }
         cmd
