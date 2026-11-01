@@ -72,6 +72,16 @@ Three interfaces exist from the first week, even when each has one implementatio
 1. Turn this directory into the workspace above, with a failing oracle test and CI for the three operating systems.
 2. Make the add-and-print program pass on this Mac, then on Linux and Windows CI.
 3. Record a baseline: clean `cargo build` and a one-line edit of that same file, with `cargo build --timings` (nightly). Write the numbers under this heading. Do not optimize before those numbers exist.
+
+   **Baseline, recorded.** MacBook Pro, Apple Silicon, macOS 27, `rustc` 1.98.1, `scripts/baseline.sh` (10 runs each, wall time, `cargo build --timings`; `--timings` is stable now, nightly is not needed). Program: `oracle/programs/add.rs` as a fresh `cargo new` binary, debug profile.
+
+   | Build | Median | Range |
+   |---|---|---|
+   | Clean `cargo build` (after `cargo clean`) | 0.309 s | 0.305–0.497 s |
+   | One-line edit (`add(2, 3)` ↔ `add(2, 4)`), `cargo build` | 0.127 s | 0.126–0.134 s |
+   | No-op `cargo build` | 0.037 s | 0.035–0.038 s |
+
+   For scale, not comparison: Athrad’s back half on the same program (hand-written IR → verify → Cranelift → object → `cc`) is 74 ms median, of which verify and codegen are 0.26 ms. The rest is the system linker. `cargo run --release -p oracle --example time_athrad`. Nothing has been optimized.
 4. Read, in this order, only enough to copy the seams: Cranelift’s object-emission API, the `object` crate’s write path for the host format, and the MIR-to-Cranelift lowering in `rustc_codegen_cranelift`. Blaze’s v2 plan is a map of later lanes, not the first month’s work.
 
 ## Out of scope until a milestone names it
@@ -84,5 +94,18 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-* No code, no Cargo manifest, no git history.
-* Next change is milestone 0.
+Milestone 0 is done on macOS (aarch64) and Linux (aarch64 and x86_64, checked in Docker). Windows is written but has not run yet: there is no Git remote, so CI has never run. Push to GitHub and watch `.github/workflows/ci.yml` before starting milestone 1.
+
+* `ir`: types (`i8`, `i32`, `i64`), constants, wrapping arithmetic, compares, extends and truncates, calls by name, jumps, branches, returns. SSA with block parameters. `ir::verify` checks types, dominance, and terminators; codegen assumes verified IR.
+* `codegen`: IR → Cranelift 0.137 → `object::write::Object` for the host. `opt_level=none`, PIC except on Windows.
+* `link`: the `ObjectFormat` seam (ELF, Mach-O, COFF) and the `Linker` seam with one implementation, `HostCc`: `cc` on Unix, `link.exe` found by the `cc` crate on MSVC (`msvcrt`, `vcruntime`, `ucrt`, `kernel32`).
+* `oracle`: builds each program in `oracle::programs::ALL` with `rustc --edition 2024` (debug) and with Athrad, runs both, and compares stdout, stderr, and exit status. `cargo test` runs it. One test checks that the oracle catches a wrong answer.
+* `athrad` (a fifth crate, not in the plan above): the pipeline that joins the four (`athrad::build`), the runtime written in IR (`athrad::rt`: a C `main` that calls the program’s main, as `lang_start` does, and `println!` of an `i64` through `putchar`), and the `Watcher` trait with no implementation yet. It becomes the `athrad` command when there is Rust to take in, at milestone 1.
+
+Things to know before milestone 1:
+
+* There is no frontend. Each oracle program is Rust source plus the same program written by hand as IR.
+* IR arithmetic wraps. `rustc` debug builds panic on overflow with exit code 101. The IR from MIR must carry MIR’s overflow assertions and reproduce the panic message, or reject the program.
+* On Windows, the runtime puts stdout in binary mode (`_setmode(1, _O_BINARY)`), because Rust prints `\n` and the C runtime would print `\r\n`.
+* Stdout goes through C `stdio`. Rust’s stdout is line-buffered and C’s is fully buffered when piped. That does not matter until a program writes to both stdout and stderr, or panics after printing.
+* First-week step 4, reading Cranelift, `object`, and `rustc_codegen_cranelift`, has only gone as far as the object-emission API this needed.

@@ -13,5 +13,8 @@ athrad.workspace = true
 ir.workspace = true
 link.workspace = true
 
+[dev-dependencies]
+codegen.workspace = true
+
 [lints]
 workspace = true
