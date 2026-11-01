@@ -1,0 +1,19 @@
+[package]
+name = "frontend"
+description = "Take MIR from rustc and lower it to Athrad IR."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[dependencies]
+anyhow.workspace = true
+ir.workspace = true
+link.workspace = true
+
+[lints]
+workspace = true

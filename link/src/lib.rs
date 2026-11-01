@@ -90,9 +90,37 @@ pub fn executable_name(stem: &str) -> String {
     format!("{stem}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Turns object files into an executable.
+/// Everything an executable is linked from.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Inputs {
+    /// Object files, linked whole.
+    pub objects: Vec<PathBuf>,
+    /// Archives (`std`'s rlibs), in the order `rustc` gives them: a crate
+    /// before the crates it depends on.
+    pub archives: Vec<PathBuf>,
+    /// System libraries the archives need, after them.
+    pub libs: Vec<NativeLib>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NativeLib {
+    pub name: String,
+    pub kind: LibKind,
+    /// `name` is the file name itself, not a stem for the linker to decorate.
+    pub verbatim: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LibKind {
+    Dylib,
+    Static,
+    /// A macOS framework.
+    Framework,
+}
+
+/// Turns object files and libraries into an executable.
 pub trait Linker {
-    fn link(&self, objects: &[PathBuf], output: &Path) -> Result<()>;
+    fn link(&self, inputs: &Inputs, output: &Path) -> Result<()>;
 }
 
 /// The host C toolchain. On Unix this is the compiler `CC` names, or `cc`; on
@@ -167,17 +195,31 @@ fn unix_compiler(target: &str, var: impl Fn(&str) -> Option<OsString>) -> (OsStr
 }
 
 impl Linker for HostCc {
-    fn link(&self, objects: &[PathBuf], output: &Path) -> Result<()> {
+    fn link(&self, inputs: &Inputs, output: &Path) -> Result<()> {
         let mut cmd = self.command();
         if self.msvc {
             cmd.arg("/NOLOGO").arg("/SUBSYSTEM:CONSOLE");
             cmd.arg(format!("/OUT:{}", output.display()));
-            cmd.args(objects);
+            cmd.args(&inputs.objects).args(&inputs.archives);
+            for lib in &inputs.libs {
+                match (lib.kind, lib.verbatim) {
+                    (LibKind::Framework, _) => bail!("framework `{}` on Windows", lib.name),
+                    (_, true) => cmd.arg(&lib.name),
+                    (_, false) => cmd.arg(format!("{}.lib", lib.name)),
+                };
+            }
             // The dynamic C runtime, as rustc links it by default.
             cmd.args(["msvcrt.lib", "vcruntime.lib", "ucrt.lib", "kernel32.lib"]);
         } else {
             cmd.arg("-o").arg(output);
-            cmd.args(objects);
+            cmd.args(&inputs.objects).args(&inputs.archives);
+            for lib in &inputs.libs {
+                match (lib.kind, lib.verbatim) {
+                    (LibKind::Framework, _) => cmd.args(["-framework", &lib.name]),
+                    (_, true) => cmd.arg(format!("-l:{}", lib.name)),
+                    (_, false) => cmd.arg(format!("-l{}", lib.name)),
+                };
+            }
         }
         let program = Path::new(&self.program).display();
         let out = cmd.output().with_context(|| format!("running linker {program}"))?;

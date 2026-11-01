@@ -1,0 +1,5 @@
+# `frontend` uses rustc's own crates (#![feature(rustc_private)]) on the pinned
+# stable toolchain, which needs this. Nothing else in the workspace uses a
+# feature gate; the oracle strips it before running rustc.
+[env]
+RUSTC_BOOTSTRAP = "1"

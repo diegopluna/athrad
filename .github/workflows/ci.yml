@@ -19,7 +19,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the rustc Athrad drives through rustc-dev.
+      - uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: rustc-dev, llvm-tools
       - uses: Swatinem/rust-cache@v2
       - run: rustc -vV
       # The oracle compiles each program with this same rustc and diffs the runs.
@@ -29,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
-          components: rustfmt, clippy
+          components: rustc-dev, llvm-tools, rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

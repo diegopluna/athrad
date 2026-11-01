@@ -1,0 +1,6 @@
+# Athrad drives this exact rustc (through rustc-dev) and checks itself against
+# it, so the frontend and the oracle are one compiler.
+[toolchain]
+channel = "1.98.1"
+components = ["rustc-dev", "llvm-tools", "rustfmt", "clippy"]
+profile = "minimal"

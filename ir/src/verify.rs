@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::{BlockId, Function, Inst, Module, Op, Target, Terminator, Type, Value};
+use crate::{BlockId, Function, Inst, Module, Op, PTR, Symbol, Target, Terminator, Type, Value};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifyError {
@@ -24,13 +24,33 @@ impl fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 pub fn verify(module: &Module) -> Result<(), VerifyError> {
+    let module_err = |message: String| VerifyError { function: None, message };
     let mut names = HashSet::new();
-    for name in module.externs.iter().map(|e| &e.name).chain(module.functions.iter().map(|f| &f.name)) {
+    let all = module
+        .imports
+        .iter()
+        .map(|e| &e.name)
+        .chain(module.functions.iter().map(|f| &f.name))
+        .chain(module.data.iter().map(|d| &d.name));
+    for name in all {
         if name.is_empty() {
-            return Err(VerifyError { function: None, message: "empty symbol name".into() });
+            return Err(module_err("empty symbol name".into()));
         }
         if !names.insert(name) {
-            return Err(VerifyError { function: None, message: format!("symbol `{name}` is defined twice") });
+            return Err(module_err(format!("symbol `{name}` is defined twice")));
+        }
+    }
+    for d in &module.data {
+        if !d.align.is_power_of_two() {
+            return Err(module_err(format!("data `{}` has alignment {}", d.name, d.align)));
+        }
+        for r in &d.relocs {
+            if r.offset as usize + 8 > d.bytes.len() {
+                return Err(module_err(format!("data `{}` has a relocation past its end", d.name)));
+            }
+            if module.symbol(&r.symbol).is_none() {
+                return Err(module_err(format!("data `{}` refers to unknown symbol `{}`", d.name, r.symbol)));
+            }
         }
     }
     for func in &module.functions {
@@ -53,15 +73,20 @@ impl Checker<'_> {
             return Err("no blocks".into());
         };
         let entry_types: Vec<Type> = entry.params.iter().map(|&p| self.ty(p)).collect::<Result<_, _>>()?;
-        if entry_types != func.sig.params {
+        if entry_types != func.sig.param_types() {
             return Err("entry block parameters do not match the signature".into());
+        }
+        for s in &func.slots {
+            if !s.align.is_power_of_two() {
+                return Err(format!("stack slot with alignment {}", s.align));
+            }
         }
 
         // Every value is defined exactly once, by a block parameter or an instruction.
         let mut defined_in = vec![None; func.values.len()];
         for (b, block) in func.blocks.iter().enumerate() {
-            let defs = block.params.iter().copied().chain(block.insts.iter().filter_map(|i| i.result));
-            for v in defs {
+            let defs = block.params.iter().chain(block.insts.iter().flat_map(|i| &i.results));
+            for &v in defs {
                 let slot = defined_in.get_mut(v.0 as usize).ok_or_else(|| format!("{v} has no type"))?;
                 if slot.replace(b).is_some() {
                     return Err(format!("{v} is defined twice"));
@@ -82,22 +107,19 @@ impl Checker<'_> {
                 if ok { Ok(ty) } else { Err(format!("{v} is used in {id} where its definition does not dominate")) }
             };
             for inst in &block.insts {
-                let ty = self.check_inst(inst, |v| available(v, &local))?;
-                match (inst.result, ty) {
-                    (Some(r), Some(ty)) if self.ty(r)? == ty => {}
-                    (None, None) => {}
-                    _ => return Err(format!("{id}: result of `{:?}` has the wrong type", inst.op)),
+                let types = self.check_inst(inst, |v| available(v, &local)).map_err(|e| format!("{id}: {e}"))?;
+                let results: Vec<Type> = inst.results.iter().map(|&r| self.ty(r)).collect::<Result<_, _>>()?;
+                if results != types {
+                    return Err(format!("{id}: results of `{:?}` have the wrong types", inst.op));
                 }
-                if let Some(r) = inst.result {
-                    local.insert(r);
-                }
+                local.extend(inst.results.iter().copied());
             }
             match &block.term {
                 None => return Err(format!("{id} has no terminator")),
-                Some(Terminator::Return(v)) => {
-                    let ty = v.map(|v| available(v, &local)).transpose()?;
-                    if ty != func.sig.ret {
-                        return Err(format!("{id}: return type does not match the signature"));
+                Some(Terminator::Return(vs)) => {
+                    let types: Vec<Type> = vs.iter().map(|&v| available(v, &local)).collect::<Result<_, _>>()?;
+                    if types != func.sig.return_types() {
+                        return Err(format!("{id}: return values do not match the signature"));
                     }
                 }
                 Some(Terminator::Jump(t)) => self.check_target(t, |v| available(v, &local))?,
@@ -106,6 +128,7 @@ impl Checker<'_> {
                     self.check_target(then, |v| available(v, &local))?;
                     self.check_target(otherwise, |v| available(v, &local))?;
                 }
+                Some(Terminator::Trap) => {}
             }
         }
         Ok(())
@@ -115,42 +138,88 @@ impl Checker<'_> {
         self.func.value_type(v).ok_or_else(|| format!("{v} has no type"))
     }
 
-    fn check_inst(&self, inst: &Inst, use_: impl Fn(Value) -> Result<Type, String>) -> Result<Option<Type>, String> {
+    /// The types of the values `inst` defines.
+    fn check_inst(&self, inst: &Inst, use_: impl Fn(Value) -> Result<Type, String>) -> Result<Vec<Type>, String> {
+        let same = |a: Value, b: Value, what: &dyn fmt::Debug| -> Result<Type, String> {
+            let (ta, tb) = (use_(a)?, use_(b)?);
+            if ta != tb {
+                return Err(format!("{what:?} of {ta} and {tb}"));
+            }
+            Ok(ta)
+        };
+        let ptr = |v: Value| -> Result<(), String> {
+            let t = use_(v)?;
+            if t != PTR { Err(format!("{v} is used as an address but is {t}")) } else { Ok(()) }
+        };
+        let args_match = |name: &str, args: &[Value], params: Vec<Type>| -> Result<(), String> {
+            let types: Vec<Type> = args.iter().map(|&a| use_(a)).collect::<Result<_, _>>()?;
+            if types != params {
+                return Err(format!("arguments to `{name}` do not match its signature"));
+            }
+            Ok(())
+        };
         Ok(match &inst.op {
-            Op::Const(ty, _) => Some(*ty),
-            Op::Binary(op, a, b) => {
-                let (ta, tb) = (use_(*a)?, use_(*b)?);
-                if ta != tb {
-                    return Err(format!("{op:?} of {ta} and {tb}"));
+            Op::Const(ty, _) => vec![*ty],
+            Op::Binary(op, a, b) => vec![same(*a, *b, op)?],
+            Op::Overflow(op, _, a, b) => {
+                let t = same(*a, *b, op)?;
+                if t == Type::I128 {
+                    return Err(format!("{op:?} overflow check of i128"));
                 }
-                Some(ta)
+                vec![t, Type::I8]
             }
             Op::Cmp(c, a, b) => {
-                let (ta, tb) = (use_(*a)?, use_(*b)?);
-                if ta != tb {
-                    return Err(format!("{c:?} of {ta} and {tb}"));
-                }
-                Some(Type::I8)
+                same(*a, *b, c)?;
+                vec![Type::I8]
+            }
+            Op::Select(c, a, b) => {
+                use_(*c)?;
+                vec![same(*a, *b, &"select")?]
             }
             Op::ZExt(to, v) | Op::SExt(to, v) => {
                 if use_(*v)?.bits() >= to.bits() {
                     return Err(format!("extension of {v} to {to} does not widen"));
                 }
-                Some(*to)
+                vec![*to]
             }
             Op::Trunc(to, v) => {
                 if use_(*v)?.bits() <= to.bits() {
                     return Err(format!("truncation of {v} to {to} does not narrow"));
                 }
-                Some(*to)
+                vec![*to]
+            }
+            Op::SlotAddr(s) => {
+                if s.0 as usize >= self.func.slots.len() {
+                    return Err(format!("{s} does not exist"));
+                }
+                vec![PTR]
+            }
+            Op::SymbolAddr(name) => {
+                self.module.symbol(name).ok_or_else(|| format!("address of unknown symbol `{name}`"))?;
+                vec![PTR]
+            }
+            Op::Load(ty, addr, _) => {
+                ptr(*addr)?;
+                vec![*ty]
+            }
+            Op::Store(addr, _, v) => {
+                ptr(*addr)?;
+                use_(*v)?;
+                vec![]
             }
             Op::Call(name, args) => {
-                let sig = self.module.signature(name).ok_or_else(|| format!("call to unknown function `{name}`"))?;
-                let types: Vec<Type> = args.iter().map(|&a| use_(a)).collect::<Result<_, _>>()?;
-                if types != sig.params {
-                    return Err(format!("arguments to `{name}` do not match its signature"));
-                }
-                sig.ret
+                let sig = match self.module.symbol(name) {
+                    Some(Symbol::Func(sig)) => sig,
+                    Some(Symbol::Data) => return Err(format!("call to data symbol `{name}`")),
+                    None => return Err(format!("call to unknown function `{name}`")),
+                };
+                args_match(name, args, sig.param_types())?;
+                sig.return_types()
+            }
+            Op::CallIndirect(sig, callee, args) => {
+                ptr(*callee)?;
+                args_match("indirect callee", args, sig.param_types())?;
+                sig.return_types()
             }
         })
     }
@@ -171,16 +240,19 @@ impl Checker<'_> {
     fn predecessors(&self) -> Result<Vec<Vec<usize>>, String> {
         let mut preds = vec![Vec::new(); self.func.blocks.len()];
         for (b, block) in self.func.blocks.iter().enumerate() {
-            let succs: Vec<BlockId> = match &block.term {
-                Some(Terminator::Jump(t)) => vec![t.block],
-                Some(Terminator::Branch { then, otherwise, .. }) => vec![then.block, otherwise.block],
-                _ => vec![],
-            };
-            for s in succs {
+            for s in successors(block.term.as_ref()) {
                 preds.get_mut(s.0 as usize).ok_or_else(|| format!("branch to missing {s}"))?.push(b);
             }
         }
         Ok(preds)
+    }
+}
+
+fn successors(term: Option<&Terminator>) -> Vec<BlockId> {
+    match term {
+        Some(Terminator::Jump(t)) => vec![t.block],
+        Some(Terminator::Branch { then, otherwise, .. }) => vec![then.block, otherwise.block],
+        _ => vec![],
     }
 }
 
@@ -215,11 +287,10 @@ mod tests {
     use crate::*;
 
     fn add_fn() -> Function {
-        let mut b =
-            FunctionBuilder::new("add", Linkage::Local, Signature::new([Type::I64, Type::I64], Some(Type::I64)));
+        let mut b = FunctionBuilder::new("add", Linkage::Local, Signature::new([Type::I64, Type::I64], [Type::I64]));
         let p = b.params();
         let s = b.add(p[0], p[1]);
-        b.ret(Some(s));
+        b.ret(&[s]);
         b.finish()
     }
 
@@ -232,9 +303,9 @@ mod tests {
 
     #[test]
     fn rejects_wrong_return_type() {
-        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::new([], Some(Type::I64)));
+        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::new([], [Type::I64]));
         let v = b.iconst(Type::I32, 1);
-        b.ret(Some(v));
+        b.ret(&[v]);
         let mut m = Module::new();
         m.push(b.finish());
         assert!(verify(&m).is_err());
@@ -243,8 +314,8 @@ mod tests {
     #[test]
     fn rejects_unknown_callee() {
         let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::default());
-        b.call("missing", &[], None);
-        b.ret(None);
+        b.call("missing", &[], &[]);
+        b.ret(&[]);
         let mut m = Module::new();
         m.push(b.finish());
         assert!(verify(&m).unwrap_err().message.contains("missing"));
@@ -252,16 +323,16 @@ mod tests {
 
     #[test]
     fn rejects_use_without_dominating_def() {
-        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::new([Type::I8], Some(Type::I64)));
+        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::new([Type::I8], [Type::I64]));
         let c = b.params()[0];
         let (left, _) = b.block(&[]);
         let (right, _) = b.block(&[]);
         b.branch(c, (left, &[]), (right, &[]));
         b.switch_to(left);
         let v = b.iconst(Type::I64, 1);
-        b.ret(Some(v));
+        b.ret(&[v]);
         b.switch_to(right);
-        b.ret(Some(v));
+        b.ret(&[v]);
         let mut m = Module::new();
         m.push(b.finish());
         assert!(verify(&m).unwrap_err().message.contains("dominate"));
@@ -273,5 +344,30 @@ mod tests {
         m.push(add_fn());
         m.push(add_fn());
         assert!(verify(&m).is_err());
+    }
+
+    #[test]
+    fn rejects_non_pointer_address() {
+        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::new([Type::I32], []));
+        let p = b.params()[0];
+        b.load(Type::I8, p, 0);
+        b.ret(&[]);
+        let mut m = Module::new();
+        m.push(b.finish());
+        assert!(verify(&m).unwrap_err().message.contains("address"));
+    }
+
+    #[test]
+    fn rejects_relocation_to_unknown_symbol() {
+        let mut m = Module::new();
+        m.push_data(Data {
+            name: "d".into(),
+            linkage: Linkage::Local,
+            writable: false,
+            align: 8,
+            bytes: vec![0; 8],
+            relocs: vec![Reloc { offset: 0, symbol: "nowhere".into(), addend: 0 }],
+        });
+        assert!(verify(&m).unwrap_err().message.contains("nowhere"));
     }
 }

@@ -7,49 +7,103 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{self as clif, AbiParam, BlockArg, InstBuilder, types};
+use cranelift_codegen::ir::{
+    self as clif, AbiParam, ArgumentPurpose, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
+    TrapCode, types,
+};
 use cranelift_codegen::isa::OwnedTargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+
+mod unwind;
 
 /// Compile `module` for the host into an object named `name`.
 pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<'static>> {
     let isa = host_isa()?;
-    let builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())?;
+    let builder = ObjectBuilder::new(isa.clone(), name, cranelift_module::default_libcall_names())?;
     let mut obj = ObjectModule::new(builder);
 
-    // Declare every symbol first, so calls can refer to any of them.
-    let mut ids: HashMap<&str, FuncId> = HashMap::new();
-    for ext in &module.externs {
-        let sig = signature(&obj, &ext.sig);
-        ids.insert(&ext.name, obj.declare_function(&ext.name, Linkage::Import, &sig)?);
+    // Declare every symbol first, so code and data can refer to any of them.
+    let mut ids: HashMap<&str, Id> = HashMap::new();
+    for imp in &module.imports {
+        let id = match &imp.kind {
+            ir::ImportKind::Func(sig) => {
+                Id::Func(obj.declare_function(&imp.name, Linkage::Import, &signature(&obj, sig))?)
+            }
+            ir::ImportKind::Data => Id::Data(obj.declare_data(&imp.name, Linkage::Import, false, false)?),
+        };
+        ids.insert(&imp.name, id);
     }
     for func in &module.functions {
         let sig = signature(&obj, &func.sig);
-        let linkage = match func.linkage {
-            ir::Linkage::Local => Linkage::Local,
-            ir::Linkage::Export => Linkage::Export,
-        };
-        ids.insert(&func.name, obj.declare_function(&func.name, linkage, &sig)?);
+        ids.insert(&func.name, Id::Func(obj.declare_function(&func.name, linkage(func.linkage), &sig)?));
+    }
+    for d in &module.data {
+        ids.insert(&d.name, Id::Data(obj.declare_data(&d.name, linkage(d.linkage), d.writable, false)?));
+    }
+
+    for d in &module.data {
+        let mut desc = DataDescription::new();
+        desc.define(d.bytes.clone().into_boxed_slice());
+        desc.set_align(d.align);
+        for r in &d.relocs {
+            match ids[r.symbol.as_str()] {
+                Id::Func(f) => {
+                    if r.addend != 0 {
+                        bail!("data `{}`: function address `{}` with an addend", d.name, r.symbol);
+                    }
+                    let f = obj.declare_func_in_data(f, &mut desc);
+                    desc.write_function_addr(r.offset, f);
+                }
+                Id::Data(target) => {
+                    let gv = obj.declare_data_in_data(target, &mut desc);
+                    desc.write_data_addr(r.offset, gv, r.addend);
+                }
+            }
+        }
+        let Id::Data(id) = ids[d.name.as_str()] else { unreachable!() };
+        obj.define_data(id, &desc).with_context(|| format!("defining data {}", d.name))?;
     }
 
     let mut ctx = obj.make_context();
     let mut fb_ctx = FunctionBuilderContext::new();
+    let mut unwind_entries = Vec::new();
     for func in &module.functions {
         ctx.func.signature = signature(&obj, &func.sig);
         lower(&mut obj, &ids, func, &mut ctx, &mut fb_ctx);
-        obj.define_function(ids[func.name.as_str()], &mut ctx)
+        let Id::Func(id) = ids[func.name.as_str()] else { unreachable!() };
+        obj.define_function(id, &mut ctx)
             .map_err(|e| anyhow!("{e:?}"))
             .with_context(|| format!("compiling fn {}", func.name))?;
+        let code = ctx.compiled_code().expect("defined");
+        if let Some(info) = code.create_unwind_info(obj.isa())? {
+            unwind_entries.push(unwind::Entry { func: id, info, size: code.code_info().total_size });
+        }
         obj.clear_context(&mut ctx);
     }
 
-    Ok(obj.finish().object)
+    let mut product = obj.finish();
+    unwind::emit(&*isa, &mut product, unwind_entries)?;
+    Ok(product.object)
+}
+
+#[derive(Clone, Copy)]
+enum Id {
+    Func(FuncId),
+    Data(DataId),
+}
+
+fn linkage(l: ir::Linkage) -> Linkage {
+    match l {
+        ir::Linkage::Local => Linkage::Local,
+        ir::Linkage::Hidden => Linkage::Hidden,
+        ir::Linkage::Export => Linkage::Export,
+    }
 }
 
 /// The host ISA, set up for fast compiles of position-independent code.
@@ -68,21 +122,36 @@ fn host_isa() -> Result<OwnedTargetIsa> {
 fn clif_type(ty: ir::Type) -> clif::Type {
     match ty {
         ir::Type::I8 => types::I8,
+        ir::Type::I16 => types::I16,
         ir::Type::I32 => types::I32,
         ir::Type::I64 => types::I64,
+        ir::Type::I128 => types::I128,
+    }
+}
+
+fn abi_param(p: &ir::Param) -> AbiParam {
+    let a = if p.sret {
+        AbiParam::special(clif_type(p.ty), ArgumentPurpose::StructReturn)
+    } else {
+        AbiParam::new(clif_type(p.ty))
+    };
+    match p.ext {
+        ir::Ext::None => a,
+        ir::Ext::Zero => a.uext(),
+        ir::Ext::Sign => a.sext(),
     }
 }
 
 fn signature(obj: &ObjectModule, sig: &ir::Signature) -> clif::Signature {
     let mut s = obj.make_signature();
-    s.params.extend(sig.params.iter().map(|&t| AbiParam::new(clif_type(t))));
-    s.returns.extend(sig.ret.map(|t| AbiParam::new(clif_type(t))));
+    s.params.extend(sig.params.iter().map(abi_param));
+    s.returns.extend(sig.returns.iter().map(abi_param));
     s
 }
 
 fn lower(
     obj: &mut ObjectModule,
-    ids: &HashMap<&str, FuncId>,
+    ids: &HashMap<&str, Id>,
     func: &ir::Function,
     ctx: &mut Context,
     fb_ctx: &mut FunctionBuilderContext,
@@ -90,8 +159,17 @@ fn lower(
     let mut b = FunctionBuilder::new(&mut ctx.func, fb_ctx);
 
     let blocks: Vec<clif::Block> = func.blocks.iter().map(|_| b.create_block()).collect();
+    let slots: Vec<clif::StackSlot> = func
+        .slots
+        .iter()
+        .map(|s| {
+            let shift = s.align.trailing_zeros() as u8;
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, s.size, shift))
+        })
+        .collect();
     let mut values: Vec<Option<clif::Value>> = vec![None; func.values.len()];
-    let mut callees: HashMap<&str, clif::FuncRef> = HashMap::new();
+    let mut funcs: HashMap<&str, clif::FuncRef> = HashMap::new();
+    let mut globals: HashMap<&str, clif::GlobalValue> = HashMap::new();
 
     // Block parameters first: a branch may target a block lowered later.
     for (i, block) in func.blocks.iter().enumerate() {
@@ -101,21 +179,24 @@ fn lower(
         }
     }
 
-    // Lower in dominator-compatible order: the verifier guarantees each use
-    // is dominated by its definition, and IR block order puts the entry
-    // first, but not every definition before every use in index order. Walk
-    // in reverse postorder so definitions are lowered before their uses.
+    // Walk in reverse postorder so definitions are lowered before their uses.
     for i in reverse_postorder(func) {
         let block = &func.blocks[i];
         b.switch_to_block(blocks[i]);
         let get = |values: &[Option<clif::Value>], v: ir::Value| values[v.0 as usize].expect("verified IR");
         for inst in &block.insts {
-            let result = match &inst.op {
-                ir::Op::Const(ty, n) => Some(b.ins().iconst(clif_type(*ty), *n)),
+            let mut func_ref = |b: &mut FunctionBuilder, name: &str| -> clif::FuncRef {
+                *funcs.entry(ids.get_key_value(name).expect("verified IR").0).or_insert_with(|| {
+                    let Id::Func(id) = ids[name] else { unreachable!("verified IR: `{name}` is a function") };
+                    obj.declare_func_in_func(id, b.func)
+                })
+            };
+            let results: Vec<clif::Value> = match &inst.op {
+                ir::Op::Const(ty, n) => vec![iconst(&mut b, *ty, *n)],
                 ir::Op::Binary(op, x, y) => {
                     let (x, y) = (get(&values, *x), get(&values, *y));
                     let ins = b.ins();
-                    Some(match op {
+                    vec![match op {
                         ir::BinOp::Add => ins.iadd(x, y),
                         ir::BinOp::Sub => ins.isub(x, y),
                         ir::BinOp::Mul => ins.imul(x, y),
@@ -123,7 +204,26 @@ fn lower(
                         ir::BinOp::URem => ins.urem(x, y),
                         ir::BinOp::SDiv => ins.sdiv(x, y),
                         ir::BinOp::SRem => ins.srem(x, y),
-                    })
+                        ir::BinOp::And => ins.band(x, y),
+                        ir::BinOp::Or => ins.bor(x, y),
+                        ir::BinOp::Xor => ins.bxor(x, y),
+                        ir::BinOp::Shl => ins.ishl(x, y),
+                        ir::BinOp::UShr => ins.ushr(x, y),
+                        ir::BinOp::SShr => ins.sshr(x, y),
+                    }]
+                }
+                ir::Op::Overflow(op, signed, x, y) => {
+                    let (x, y) = (get(&values, *x), get(&values, *y));
+                    let ins = b.ins();
+                    let (r, of) = match (op, signed) {
+                        (ir::OverflowOp::Add, false) => ins.uadd_overflow(x, y),
+                        (ir::OverflowOp::Add, true) => ins.sadd_overflow(x, y),
+                        (ir::OverflowOp::Sub, false) => ins.usub_overflow(x, y),
+                        (ir::OverflowOp::Sub, true) => ins.ssub_overflow(x, y),
+                        (ir::OverflowOp::Mul, false) => ins.umul_overflow(x, y),
+                        (ir::OverflowOp::Mul, true) => ins.smul_overflow(x, y),
+                    };
+                    vec![r, of]
                 }
                 ir::Op::Cmp(c, x, y) => {
                     let cc = match c {
@@ -138,31 +238,59 @@ fn lower(
                         ir::Cmp::UGt => IntCC::UnsignedGreaterThan,
                         ir::Cmp::UGe => IntCC::UnsignedGreaterThanOrEqual,
                     };
-                    Some(b.ins().icmp(cc, get(&values, *x), get(&values, *y)))
+                    vec![b.ins().icmp(cc, get(&values, *x), get(&values, *y))]
                 }
-                ir::Op::ZExt(ty, v) => Some(b.ins().uextend(clif_type(*ty), get(&values, *v))),
-                ir::Op::SExt(ty, v) => Some(b.ins().sextend(clif_type(*ty), get(&values, *v))),
-                ir::Op::Trunc(ty, v) => Some(b.ins().ireduce(clif_type(*ty), get(&values, *v))),
+                ir::Op::Select(c, x, y) => {
+                    vec![b.ins().select(get(&values, *c), get(&values, *x), get(&values, *y))]
+                }
+                ir::Op::ZExt(ty, v) => vec![b.ins().uextend(clif_type(*ty), get(&values, *v))],
+                ir::Op::SExt(ty, v) => vec![b.ins().sextend(clif_type(*ty), get(&values, *v))],
+                ir::Op::Trunc(ty, v) => vec![b.ins().ireduce(clif_type(*ty), get(&values, *v))],
+                ir::Op::SlotAddr(s) => vec![b.ins().stack_addr(types::I64, slots[s.0 as usize], 0)],
+                ir::Op::SymbolAddr(name) => match ids[name.as_str()] {
+                    Id::Func(_) => {
+                        let f = func_ref(&mut b, name);
+                        vec![b.ins().func_addr(types::I64, f)]
+                    }
+                    Id::Data(id) => {
+                        let gv = *globals
+                            .entry(ids.get_key_value(name.as_str()).unwrap().0)
+                            .or_insert_with(|| obj.declare_data_in_func(id, b.func));
+                        vec![b.ins().symbol_value(types::I64, gv)]
+                    }
+                },
+                ir::Op::Load(ty, addr, offset) => {
+                    vec![b.ins().load(clif_type(*ty), MemFlagsData::new(), get(&values, *addr), *offset)]
+                }
+                ir::Op::Store(addr, offset, v) => {
+                    b.ins().store(MemFlagsData::new(), get(&values, *v), get(&values, *addr), *offset);
+                    vec![]
+                }
                 ir::Op::Call(name, args) => {
-                    let callee = *callees
-                        .entry(name.as_str())
-                        .or_insert_with(|| obj.declare_func_in_func(ids[name.as_str()], b.func));
+                    let callee = func_ref(&mut b, name);
                     let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
                     let call = b.ins().call(callee, &args);
-                    b.inst_results(call).first().copied()
+                    b.inst_results(call).to_vec()
+                }
+                ir::Op::CallIndirect(sig, callee, args) => {
+                    let sig = b.import_signature(signature(obj, sig));
+                    let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
+                    let call = b.ins().call_indirect(sig, get(&values, *callee), &args);
+                    b.inst_results(call).to_vec()
                 }
             };
-            if let Some(r) = inst.result {
-                values[r.0 as usize] = Some(result.expect("verified IR: result types match"));
+            assert_eq!(results.len(), inst.results.len(), "verified IR: result counts match");
+            for (r, v) in inst.results.iter().zip(results) {
+                values[r.0 as usize] = Some(v);
             }
         }
         let args = |values: &[Option<clif::Value>], t: &ir::Target| -> Vec<BlockArg> {
             t.args.iter().map(|&a| BlockArg::Value(get(values, a))).collect()
         };
         match block.term.as_ref().expect("verified IR: every block is terminated") {
-            ir::Terminator::Return(v) => {
-                let v: Vec<clif::Value> = v.iter().map(|&v| get(&values, v)).collect();
-                b.ins().return_(&v);
+            ir::Terminator::Return(vs) => {
+                let vs: Vec<clif::Value> = vs.iter().map(|&v| get(&values, v)).collect();
+                b.ins().return_(&vs);
             }
             ir::Terminator::Jump(t) => {
                 let a = args(&values, t);
@@ -178,11 +306,26 @@ fn lower(
                     &oa,
                 );
             }
+            ir::Terminator::Trap => {
+                b.ins().trap(TrapCode::user(1).expect("1 is a user trap code"));
+            }
         }
     }
 
     b.seal_all_blocks();
     b.finalize(obj.target_config());
+}
+
+fn iconst(b: &mut FunctionBuilder, ty: ir::Type, n: i128) -> clif::Value {
+    if ty == ir::Type::I128 {
+        let lo = b.ins().iconst(types::I64, n as i64);
+        let hi = b.ins().iconst(types::I64, (n >> 64) as i64);
+        return b.ins().iconcat(lo, hi);
+    }
+    // Cranelift wants narrow immediates zero-extended to 64 bits.
+    let bits = ty.bits();
+    let masked = if bits == 64 { n as i64 } else { (n as i64) & ((1i64 << bits) - 1) };
+    b.ins().iconst(clif_type(ty), masked)
 }
 
 /// Reachable blocks of `func`, each after every block that dominates it.
