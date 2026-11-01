@@ -96,18 +96,40 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-Milestone 0 is done on all three hosts. The oracle passes in CI on Ubuntu, macOS, and Windows (`windows-latest`, MSVC), and locally on macOS aarch64 and Linux aarch64 and x86_64 (Docker). The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
+Milestones 0 and 1 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
 
-* `ir`: types (`i8`, `i32`, `i64`), constants, wrapping arithmetic, compares, extends and truncates, calls by name, jumps, branches, returns. SSA with block parameters. `ir::verify` checks types, dominance, and terminators; codegen assumes verified IR.
-* `codegen`: IR → Cranelift 0.137 → `object::write::Object` for the host. `opt_level=none`, PIC except on Windows.
-* `link`: the `ObjectFormat` seam (ELF, Mach-O, COFF) and the `Linker` seam with one implementation, `HostCc`, found once by the caller and passed to `athrad::build`: `$CC` or `cc` on Unix, `link.exe` found by the `cc` crate on MSVC (`msvcrt`, `vcruntime`, `ucrt`, `kernel32`).
-* `oracle`: builds each program in `oracle::programs::ALL` with `rustc --edition 2024` (debug) and with Athrad, runs both, and compares stdout, stderr, and exit status. `cargo test` runs it. One test checks that the oracle catches a wrong answer.
-* `athrad` (a fifth crate, not in the plan above): the pipeline that joins the four (`athrad::build`), the runtime written in IR (`athrad::rt`: a C `main` that calls the program’s main, as `lang_start` does, and `println!` of an `i64` through `putchar`), and the `Watcher` trait with no implementation yet. It becomes the `athrad` command when there is Rust to take in, at milestone 1.
+`athrad FILE.rs [-o OUT]` builds a one-file binary crate as `rustc --edition 2024 FILE.rs` would, and the oracle checks 14 programs that way: arithmetic and overflow panics, loops and recursion, structs, enums and `match`, `Option`/`Result`, `Vec`, `String`, `Box`, sorting, iterators and closures, generics, trait objects, `f32`/`f64` with their edge cases, `i128`/`u128`, bounds-check and `unwrap`/`expect`/`panic!` panics, and `ExitCode`.
 
-Things to know before milestone 1:
+The pipeline:
 
-* There is no frontend. Each oracle program is Rust source plus the same program written by hand as IR.
-* IR arithmetic wraps. `rustc` debug builds panic on overflow with exit code 101. The IR from MIR must carry MIR’s overflow assertions and reproduce the panic message, or reject the program.
-* On Windows, the runtime puts stdout in binary mode (`_setmode(1, _O_BINARY)`), because Rust prints `\n` and the C runtime would print `\r\n`.
-* Stdout goes through C `stdio`. Rust’s stdout is line-buffered and C’s is fully buffered when piped. That does not matter until a program writes to both stdout and stderr, or panics after printing.
-* First-week step 4, reading Cranelift, `object`, and `rustc_codegen_cranelift`, has only gone as far as the object-emission API this needed.
+```text
+.rs ─rustc 1.98.1 (rustc-dev, in-process)─▶ MIR ─frontend─▶ ir ─verify─▶ codegen (Cranelift) ─▶ object ─▶ cc / link.exe ─▶ exe
+                                                                          std's rlibs and system libraries ─┘
+```
+
+* `rust-toolchain.toml` pins 1.98.1 with `rustc-dev`. `frontend` drives that `rustc` through `rustc_driver` (`#![feature(rustc_private)]`, which `.cargo/config.toml` allows on stable with `RUSTC_BOOTSTRAP=1` for this workspace only). `rustc` parses, type-checks, borrow-checks, and monomorphizes; Athrad lowers every mono item, writes the entry and allocator shims, and links against the real `std`. The oracle's `rustc` is the same compiler.
+* `frontend` (a sixth crate): MIR → IR, after `rustc_codegen_cranelift` (the 1.98.1 source is the map). Every local lives in a stack slot; values move as scalars, scalar pairs, or addresses, as `rustc`'s layouts and calling conventions say. Blocks a constant `switchInt` rules out after monomorphization are traps, as `rustc` skips them.
+* `ir`: integers `i8`–`i128`, stack slots, loads and stores, data with relocations, symbol addresses, direct and indirect calls with multiple results, overflow-checked arithmetic, bit operations, and floats. A float is the integer of its bits; float operations say it is one, and ABI parameters carry a float flag.
+* `codegen`: Cranelift 0.137, `opt_level=none`, frame pointers, LLVM's `i128` ABI. It writes unwind tables itself: `.eh_frame` on ELF and Mach-O, `.pdata`/`.xdata` on COFF. `i128` division is inline, because compiler-builtins passes `i128` differently on each OS.
+* `link`: unchanged seams. Upstream `raw-dylib` imports (Windows `std`) are already in the rlib.
+* `oracle`: programs are only Rust source now, in `oracle/programs` (must agree) and `oracle/programs/later` (may be rejected, must never disagree). Thread ids in panic messages are masked, and both binaries run without `RUST_BACKTRACE`.
+
+Not yet, and what happens instead:
+
+* **Landing pads.** A panic unwinds through Athrad's frames without running their cleanup. That is right only when nobody can tell, so Athrad rejects `catch_unwind` (and thread spawns, which use it): every panic then ends the process. It also rejects programs whose cleanup would run a destructor with an outside effect: the program's own `Drop` impls, `BufWriter`, and trait objects that may hold either. `oracle/programs/later/drops.rs` is the case. Real landing pads are Cranelift `try_call` plus an LSDA on ELF and Mach-O, as `rustc_codegen_cranelift` does; Windows needs SEH and has no answer yet, and Athrad must not accept on one OS what it rejects on another.
+* **SIMD.** `HashMap` reaches `core::arch` (NEON on aarch64, SSE2 on x86_64) through hashbrown; `simd_*` and `llvm.*` intrinsics are unsupported. `oracle/programs/later/hashmap.rs` is the case.
+* Thread-locals, atomics, inline and global assembly, `f16`/`f128`, `i128` multiplication overflow checks, C-variadic functions, and `link-arg`/local `raw-dylib` libraries are rejected with a message naming the construct.
+* No debug info, so backtraces are empty.
+
+### Milestone 1 timings
+
+Whole-file builds, MacBook Pro (Apple Silicon), release `athrad`, median of 10, with the output binary written; `rustc` is the same 1.98.1 in debug. Athrad still runs `rustc`'s whole frontend every time; nothing is cached yet.
+
+| Program | `athrad` | `rustc` |
+|---|---|---|
+| `add.rs` | 68 ms | 85 ms |
+| `heap.rs` | 122 ms | 123 ms |
+| `floats.rs` | 89 ms | 105 ms |
+| `traits.rs` | 83 ms | 101 ms |
+
+Next is milestone 2: hash each function body, rebuild and relink only what changed, and measure that edit against `cargo build`.
