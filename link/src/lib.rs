@@ -6,9 +6,10 @@
 //! * [`Linker`]: [`HostCc`], the host C toolchain. `lld` can join it later if
 //!   a profile says the system linker is the slow part.
 //!
-//! Finding the host toolchain ([`HostCc::new`]) runs the `cc` crate's
-//! compiler probes and takes longer than a link, so find it once and reuse it.
+//! On MSVC, finding the host toolchain ([`HostCc::new`]) runs the `cc` crate's
+//! search for `link.exe`, which takes longer than a link, so find it once.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,10 +95,14 @@ pub trait Linker {
     fn link(&self, objects: &[PathBuf], output: &Path) -> Result<()>;
 }
 
-/// The host C toolchain, found the way the `cc` crate finds it: `CC` or `cc`
-/// on Unix, and on MSVC `link.exe` with the environment Visual Studio needs.
+/// The host C toolchain. On Unix this is the compiler `CC` names, or `cc`; on
+/// MSVC it is `link.exe` with the environment Visual Studio needs.
 pub struct HostCc {
-    tool: cc::Tool,
+    program: OsString,
+    /// Arguments that come before Athrad's own, from a `CC` such as
+    /// `ccache cc` or `cc -m64`.
+    args: Vec<OsString>,
+    envs: Vec<(OsString, OsString)>,
     msvc: bool,
 }
 
@@ -110,28 +115,55 @@ impl HostCc {
         if target.contains("-windows-msvc") {
             let tool = cc::windows_registry::find_tool(target, "link.exe")
                 .context("could not find the MSVC linker (link.exe); install the Visual Studio C++ build tools")?;
-            return Ok(HostCc { tool, msvc: true });
+            return Ok(Self::from_tool(&tool, true));
+        }
+        if target == HOST_TARGET {
+            // The `cc` crate's probes take longer than a link (48 ms on macOS)
+            // and, for the host, only find what this finds without them.
+            let (program, args) = unix_compiler(target, |k| std::env::var_os(k));
+            return Ok(HostCc { program, args, envs: Vec::new(), msvc: false });
         }
         let tool = cc::Build::new()
             .target(target)
-            .host(target)
+            .host(HOST_TARGET)
             .opt_level(0)
             .debug(false)
             .cargo_metadata(false)
             .cargo_warnings(false)
             .cargo_output(false)
             .try_get_compiler()
-            .context("could not find the host C compiler")?;
-        Ok(HostCc { tool, msvc: false })
+            .with_context(|| format!("could not find a C compiler for {target}"))?;
+        Ok(Self::from_tool(&tool, false))
+    }
+
+    fn from_tool(tool: &cc::Tool, msvc: bool) -> Self {
+        let envs = tool.get_envs().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+        HostCc { program: tool.path().into(), args: Vec::new(), envs, msvc }
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(self.tool.path());
-        for (k, v) in self.tool.get_envs() {
-            cmd.env(k, v);
-        }
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.args);
+        cmd.envs(self.envs.iter().map(|(k, v)| (k, v)));
         cmd
     }
+}
+
+/// The C compiler for a host `target` on Unix, as the `cc` crate picks it:
+/// the first set of `CC_<target>`, `CC_<target with underscores>`, `HOST_CC`,
+/// and `CC`, split on whitespace into a program and leading arguments, or
+/// `cc` when none is set.
+fn unix_compiler(target: &str, var: impl Fn(&str) -> Option<OsString>) -> (OsString, Vec<OsString>) {
+    let target_u = target.replace(['-', '.'], "_");
+    let names = [format!("CC_{target}"), format!("CC_{target_u}"), "HOST_CC".to_owned(), "CC".to_owned()];
+    let value = names.iter().filter_map(|n| var(n)).find(|v| !v.to_string_lossy().trim().is_empty());
+    let Some(value) = value else {
+        return ("cc".into(), Vec::new());
+    };
+    let value = value.to_string_lossy().into_owned();
+    let mut words = value.split_whitespace().map(OsString::from);
+    let program = words.next().expect("value is not blank");
+    (program, words.collect())
 }
 
 impl Linker for HostCc {
@@ -147,11 +179,11 @@ impl Linker for HostCc {
             cmd.arg("-o").arg(output);
             cmd.args(objects);
         }
-        let out = cmd.output().with_context(|| format!("running linker {}", self.tool.path().display()))?;
+        let program = Path::new(&self.program).display();
+        let out = cmd.output().with_context(|| format!("running linker {program}"))?;
         if !out.status.success() {
             bail!(
-                "linker {} failed ({})\n{}{}",
-                self.tool.path().display(),
+                "linker {program} failed ({})\n{}{}",
                 out.status,
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
@@ -171,6 +203,37 @@ mod tests {
         assert_eq!(ObjectFormat::for_target("aarch64-apple-darwin"), Some(ObjectFormat::MachO));
         assert_eq!(ObjectFormat::for_target("x86_64-pc-windows-msvc"), Some(ObjectFormat::Coff));
         assert_eq!(ObjectFormat::for_target("wasm32-unknown-unknown"), None);
+    }
+
+    fn env<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        |k| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| OsString::from(v))
+    }
+
+    fn compiler(target: &str, vars: &[(&str, &str)]) -> (OsString, Vec<OsString>) {
+        unix_compiler(target, env(vars))
+    }
+
+    #[test]
+    fn unix_compiler_defaults_to_cc() {
+        assert_eq!(compiler("x86_64-unknown-linux-gnu", &[]), ("cc".into(), vec![]));
+        assert_eq!(compiler("x86_64-unknown-linux-gnu", &[("CC", "  ")]), ("cc".into(), vec![]));
+    }
+
+    #[test]
+    fn unix_compiler_takes_the_most_specific_variable() {
+        let t = "aarch64-apple-darwin";
+        let all = [("CC", "d"), ("HOST_CC", "c"), ("CC_aarch64_apple_darwin", "b"), ("CC_aarch64-apple-darwin", "a")];
+        assert_eq!(compiler(t, &all).0, "a");
+        assert_eq!(compiler(t, &all[..3]).0, "b");
+        assert_eq!(compiler(t, &all[..2]).0, "c");
+        assert_eq!(compiler(t, &all[..1]).0, "d");
+    }
+
+    #[test]
+    fn unix_compiler_splits_wrappers_and_flags() {
+        let (program, args) = compiler("x86_64-unknown-linux-gnu", &[("CC", "ccache  clang -m64")]);
+        assert_eq!(program, "ccache");
+        assert_eq!(args, ["clang", "-m64"]);
     }
 
     #[test]
