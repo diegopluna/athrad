@@ -94,7 +94,7 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-Milestone 0 is done on macOS (aarch64) and Linux (aarch64 and x86_64, checked in Docker). Windows is written but has not run yet: there is no Git remote, so CI has never run. Push to GitHub and watch `.github/workflows/ci.yml` before starting milestone 1.
+Milestone 0 is done on all three hosts. The oracle passes in CI on Ubuntu, macOS, and Windows (`windows-latest`, MSVC), and locally on macOS aarch64 and Linux aarch64 and x86_64 (Docker). The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
 
 * `ir`: types (`i8`, `i32`, `i64`), constants, wrapping arithmetic, compares, extends and truncates, calls by name, jumps, branches, returns. SSA with block parameters. `ir::verify` checks types, dominance, and terminators; codegen assumes verified IR.
 * `codegen`: IR → Cranelift 0.137 → `object::write::Object` for the host. `opt_level=none`, PIC except on Windows.
