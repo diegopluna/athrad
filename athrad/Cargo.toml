@@ -18,8 +18,14 @@ ir.workspace = true
 link.workspace = true
 notify.workspace = true
 postcard.workspace = true
-serde.workspace = true
 subset.workspace = true
+
+[build-dependencies]
+codegen.workspace = true
+frontend.workspace = true
+ir.workspace = true
+link.workspace = true
+postcard.workspace = true
 
 [lints]
 workspace = true

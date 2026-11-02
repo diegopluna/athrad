@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Milestone 2's number: one edit to one function, rebuilt, against `cargo build`.
+"""One edit to one function, rebuilt, against `cargo build`.
 
 For each program, the edit flips one literal inside `main` back and forth
 (EDIT_FROM <-> EDIT_TO), and each tool rebuilds after every flip:
@@ -8,12 +8,12 @@ For each program, the edit flips one literal inside `main` back and forth
                   debug profile, incremental, warmed up first
   cargo release   the same project, `cargo build --release`: opt-level 3,
                   and no incremental cache, which is what that command does
-  athrad          the `athrad` command, one process per build, its caches
-                  (rustc's incremental state with Athrad's objects, and
-                  the per-function code cache) on disk, warmed up first
+  athrad          the `athrad` command, one process per build. Nothing is
+                  kept between builds: the crate is compiled again.
   athrad watch    one warm `athrad watch` process; the time is from the
                   write of the file to the end of the build, as the
-                  watcher reports it
+                  watcher reports it. The process stays up so it does not
+                  start again, and so the linker command is already known.
 
 After each build both binaries run, and their output must be the same.
 
@@ -28,7 +28,9 @@ Each run's samples are written to ATHRAD_EDIT_LOOP_JSON, or
 
 import json
 import os
+import select
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -86,6 +88,35 @@ def save():
     SAMPLES.write_text(json.dumps(RESULTS))
 
 
+def read_built(proc, name, timeout=120):
+    """Read stderr until a line says the build finished.
+
+    `rustc` may print warnings before that line. Waiting on the first line
+    would take a warning for the build, and the real line would be counted
+    against the next edit.
+    """
+    fd = proc.stderr.fileno()
+    pending = b""
+    end = time.perf_counter() + timeout
+    while time.perf_counter() < end:
+        if proc.poll() is not None and not select.select([fd], [], [], 0)[0]:
+            sys.exit(f"{name}: athrad watch exited: {pending.decode(errors='replace')}")
+        left = end - time.perf_counter()
+        if not select.select([fd], [], [], min(0.5, max(left, 0)))[0]:
+            continue
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            sys.exit(f"{name}: athrad watch closed its output: {pending.decode(errors='replace')}")
+        pending += chunk
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if b"built" in line:
+                return
+            if line.startswith(b"athrad: error") or line.startswith(b"error"):
+                sys.exit(f"{name}: athrad watch said: {line.decode(errors='replace')}")
+    sys.exit(f"{name}: athrad watch produced no build within {timeout:.0f}s")
+
+
 def main():
     if not ATHRAD.exists():
         sys.exit("build athrad first: cargo build --release -p athrad")
@@ -125,29 +156,33 @@ def main():
                     sys.exit(f"{name}: athrad and cargo disagree after an edit")
 
             # One warm watcher. It prints "built ... in N ms" per build.
+            # Its own session, so stopping it also stops the driver. Killing
+            # only the launcher leaves the driver running (and watching).
             w = subprocess.Popen(
                 [ATHRAD, "watch", "main.rs", "-o", "prog"],
                 cwd=work,
                 stderr=subprocess.PIPE,
                 env=env_clean(),
-                text=True,
+                start_new_session=True,
             )
             try:
-                w.stderr.readline()  # the first build
+                read_built(w, name)  # the first build
                 for _ in range(RUNS):
                     time.sleep(0.2)
                     t = time.perf_counter()
                     flip(work / "main.rs", a, b)
-                    line = w.stderr.readline()
-                    if "built" not in line:
-                        sys.exit(f"{name}: athrad watch said: {line}")
+                    read_built(w, name)
                     watch_ms.append((time.perf_counter() - t) * 1e3)
                     flip(proj / "src" / "main.rs", a, b)
                     timed(["cargo", "build", "-q"], proj)
                     if output(cargo_exe) != output(athrad_exe):
                         sys.exit(f"{name}: athrad watch and cargo disagree after an edit")
             finally:
-                w.kill()
+                try:
+                    os.killpg(w.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                w.wait()
 
             med = lambda xs: statistics.median(xs)
             print(

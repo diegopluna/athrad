@@ -32,7 +32,6 @@ dependencies = [
  "notify",
  "oracle",
  "postcard",
- "serde",
  "subset",
 ]
 
@@ -98,9 +97,6 @@ dependencies = [
  "gimli",
  "ir",
  "object",
- "postcard",
- "serde",
- "sha2",
  "target-lexicon",
 ]
 
@@ -153,8 +149,6 @@ version = "0.137.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eebb94b54db96b26e387bc8c698823d83d9254d551a6ed846a60cebf62ed7135"
 dependencies = [
- "serde",
- "serde_derive",
  "wasmtime-internal-core",
 ]
 
@@ -180,7 +174,6 @@ dependencies = [
  "regalloc2",
  "rustc-hash",
  "serde",
- "serde_derive",
  "smallvec",
  "target-lexicon",
  "wasmtime-internal-core",
@@ -220,8 +213,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1bffb83ac1d7052691d1710ca8eb334d4fcaad363e589f2b89d38d97bda5776"
 dependencies = [
  "cranelift-bitset",
- "serde",
- "serde_derive",
  "wasmtime-internal-core",
 ]
 
@@ -392,8 +383,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "foldhash",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -606,7 +595,6 @@ dependencies = [
  "hashbrown 0.17.1",
  "log",
  "rustc-hash",
- "serde",
  "smallvec",
 ]
 
@@ -677,9 +665,6 @@ name = "smallvec"
 version = "1.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
-dependencies = [
- "serde",
-]
 
 [[package]]
 name = "stable_deref_trait"

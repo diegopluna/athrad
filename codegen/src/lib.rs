@@ -5,7 +5,8 @@
 //! renaming. The module must have passed [`ir::verify`]; this crate panics on
 //! IR the verifier rejects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use cranelift_codegen::Context;
@@ -14,40 +15,24 @@ use cranelift_codegen::ir::{
     self as clif, AbiParam, ArgumentPurpose, BlockArg, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind,
     TrapCode, types,
 };
-use cranelift_codegen::isa::OwnedTargetIsa;
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleReloc, ModuleRelocTarget};
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
-mod cache;
+mod code;
 mod unwind;
 
-pub use cache::{Cache, Stats};
-
-/// Identifies this build of the code generator: a hash of its sources.
-pub fn build_id() -> &'static str {
-    env!("ATHRAD_CODEGEN_BUILD_ID")
-}
-
 /// Compile `module` for the host into an object named `name`.
+///
+/// Every function is compiled, on every core once there are enough of them
+/// to be worth a thread. The object is then filled in source order, so two
+/// compiles of the same module produce the same bytes.
 pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<'static>> {
-    Ok(compile_cached(module, name, &mut Cache::in_memory())?.0)
-}
-
-/// Like [`compile`], taking each function's machine code from `cache` when
-/// its key is there, and adding the ones that are not.
-pub fn compile_cached(
-    module: &ir::Module,
-    name: &str,
-    cache: &mut Cache,
-) -> Result<(object::write::Object<'static>, Stats)> {
-    cache.begin();
-    let mut stats = Stats::default();
-    // Module-wide checks every time; a function's own only when its code is
-    // not cached, since a hit means this very IR was checked before.
     let verifier = ir::Verifier::new(module).context("invalid IR")?;
     let isa = host_isa()?;
+    let call_conv = isa.default_call_conv();
     let builder = ObjectBuilder::new(isa.clone(), name, cranelift_module::default_libcall_names())?;
     let mut obj = ObjectModule::new(builder);
 
@@ -56,7 +41,7 @@ pub fn compile_cached(
     for imp in &module.imports {
         let id = match &imp.kind {
             ir::ImportKind::Func(sig) => {
-                Id::Func(obj.declare_function(&imp.name, Linkage::Import, &signature(&obj, sig))?)
+                Id::Func(obj.declare_function(&imp.name, Linkage::Import, &signature(call_conv, sig))?)
             }
             ir::ImportKind::Data => Id::Data(obj.declare_data(&imp.name, Linkage::Import, false, false)?),
             ir::ImportKind::ThreadLocal => Id::Data(obj.declare_data(&imp.name, Linkage::Import, true, true)?),
@@ -64,11 +49,11 @@ pub fn compile_cached(
         ids.insert(&imp.name, id);
     }
     for func in &module.functions {
-        let sig = signature(&obj, &func.sig);
+        let sig = signature(call_conv, &func.sig);
         ids.insert(&func.name, Id::Func(obj.declare_function(&func.name, linkage(func.linkage), &sig)?));
     }
     for f in &module.raw {
-        let sig = signature(&obj, &f.sig);
+        let sig = signature(call_conv, &f.sig);
         let id = obj.declare_function(&f.name, Linkage::Local, &sig)?;
         obj.define_function_bytes(id, 16, &f.bytes, &[]).map_err(|e| anyhow!("{e:?}"))?;
         ids.insert(&f.name, Id::Func(id));
@@ -100,32 +85,33 @@ pub fn compile_cached(
         obj.define_data(id, &desc).with_context(|| format!("defining data {}", d.name))?;
     }
 
-    let mut sigs: HashMap<&str, &ir::Signature> = HashMap::new();
+    let mut by_name: HashMap<&str, Sym<'_>> = HashMap::new();
     for imp in &module.imports {
-        if let ir::ImportKind::Func(sig) = &imp.kind {
-            sigs.insert(&imp.name, sig);
-        }
+        let (ir_sig, tls) = match &imp.kind {
+            ir::ImportKind::Func(sig) => (Some(sig), false),
+            ir::ImportKind::Data => (None, false),
+            ir::ImportKind::ThreadLocal => (None, true),
+        };
+        let id = ids[imp.name.as_str()];
+        let clif_sig = ir_sig.map(|sig| signature(call_conv, sig));
+        by_name.insert(imp.name.as_str(), Sym { id, ir_sig, clif_sig, colocated: false, tls });
     }
     for func in &module.functions {
-        sigs.insert(&func.name, &func.sig);
+        let id = ids[func.name.as_str()];
+        let clif_sig = Some(signature(call_conv, &func.sig));
+        by_name.insert(func.name.as_str(), Sym { id, ir_sig: Some(&func.sig), clif_sig, colocated: true, tls: false });
     }
     for f in &module.raw {
-        sigs.insert(&f.name, &f.sig);
+        let id = ids[f.name.as_str()];
+        let clif_sig = Some(signature(call_conv, &f.sig));
+        by_name.insert(f.name.as_str(), Sym { id, ir_sig: Some(&f.sig), clif_sig, colocated: true, tls: false });
     }
+    for d in &module.data {
+        let id = ids[d.name.as_str()];
+        by_name.insert(d.name.as_str(), Sym { id, ir_sig: None, clif_sig: None, colocated: true, tls: d.tls });
+    }
+    let syms = Syms { by_name, call_conv, target_config: isa.frontend_config() };
 
-    let imported: HashSet<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
-    let tls_names: HashSet<&str> = module
-        .imports
-        .iter()
-        .filter(|i| matches!(i.kind, ir::ImportKind::ThreadLocal))
-        .map(|i| i.name.as_str())
-        .chain(module.data.iter().filter(|d| d.tls).map(|d| d.name.as_str()))
-        .collect();
-    let symbol_kind = |name: &str| match (ids.get(name), sigs.get(name)) {
-        (Some(Id::Func(_)), Some(sig)) => cache::SymbolKind::Func { import: imported.contains(name), sig },
-        (Some(_), _) => cache::SymbolKind::Data { import: imported.contains(name), tls: tls_names.contains(name) },
-        (None, _) => cache::SymbolKind::Missing,
-    };
     let names: HashMap<u32, &str> = ids
         .iter()
         .filter_map(|(&n, id)| match id {
@@ -141,35 +127,11 @@ pub fn compile_cached(
         })
         .collect();
 
-    let mut ctx = obj.make_context();
-    let mut fb_ctx = FunctionBuilderContext::new();
+    let compiled = compile_functions(&*isa, &verifier, &syms, module, &names, &data_names)?;
+
     let mut unwind_entries = Vec::new();
-    for func in &module.functions {
+    for (func, entry) in module.functions.iter().zip(compiled) {
         let Id::Func(id) = ids[func.name.as_str()] else { unreachable!() };
-        let key = cache::key(&*isa, func, symbol_kind);
-        let entry = match cache.get(&key) {
-            Some(entry) => {
-                stats.hits += 1;
-                entry
-            }
-            None => {
-                stats.misses += 1;
-                verifier.function(func).context("invalid IR")?;
-                if let Some(v) = std::env::var_os("ATHRAD_SHOW_MISSES") {
-                    eprintln!("athrad: compiling {}", func.name);
-                    if v == "ir" {
-                        eprintln!("{func}");
-                    }
-                }
-                ctx.func.signature = signature(&obj, &func.sig);
-                lower(&mut obj, &ids, &sigs, func, &mut ctx, &mut fb_ctx);
-                let entry = compile_one(&*isa, &mut ctx, &names, &data_names)
-                    .with_context(|| format!("compiling fn {}", func.name))?;
-                obj.clear_context(&mut ctx);
-                cache.insert(key, &entry)?;
-                entry
-            }
-        };
         let relocs: Vec<ModuleReloc> = entry
             .relocs
             .iter()
@@ -178,17 +140,17 @@ pub fn compile_cached(
                 kind: r.kind,
                 addend: r.addend,
                 name: match &r.target {
-                    cache::Target::Func(n) => match ids[n.as_str()] {
+                    code::Target::Func(n) => match ids[n.as_str()] {
                         Id::Func(f) => ModuleRelocTarget::from(f),
-                        Id::Data(_) => unreachable!("cached code calls `{n}` as a function"),
+                        Id::Data(_) => unreachable!("`{n}` is data, and the code calls it"),
                     },
-                    cache::Target::Data(n) => match ids[n.as_str()] {
+                    code::Target::Data(n) => match ids[n.as_str()] {
                         Id::Data(d) => ModuleRelocTarget::from(d),
-                        Id::Func(_) => unreachable!("cached code reads `{n}` as data"),
+                        Id::Func(_) => unreachable!("`{n}` is a function, and the code reads it"),
                     },
-                    cache::Target::LibCall(l) => ModuleRelocTarget::LibCall(*l),
-                    cache::Target::Known(k) => ModuleRelocTarget::KnownSymbol(*k),
-                    cache::Target::SelfOffset(o) => ModuleRelocTarget::FunctionOffset(id, *o),
+                    code::Target::LibCall(l) => ModuleRelocTarget::LibCall(*l),
+                    code::Target::Known(k) => ModuleRelocTarget::KnownSymbol(*k),
+                    code::Target::SelfOffset(o) => ModuleRelocTarget::FunctionOffset(id, *o),
                 },
             })
             .collect();
@@ -200,24 +162,91 @@ pub fn compile_cached(
                 func: id,
                 info,
                 size: entry.code.len() as u32,
-                call_sites: entry.call_sites.clone(),
+                call_sites: entry.call_sites,
             });
         }
     }
 
     let mut product = obj.finish();
     unwind::emit(&*isa, &mut product, unwind_entries)?;
-    Ok((product.object, stats))
+    Ok(product.object)
 }
 
-/// Compile the function in `ctx` to a cache entry: its bytes, its
-/// relocations with symbols by name, and its unwind info.
+/// How many functions one thread compiles before another thread is worth spawning.
+const PARALLEL_AT: usize = 8;
+
+fn compile_functions(
+    isa: &dyn cranelift_codegen::isa::TargetIsa,
+    verifier: &ir::Verifier<'_>,
+    syms: &Syms<'_>,
+    module: &ir::Module,
+    names: &HashMap<u32, &str>,
+    data_names: &HashMap<u32, &str>,
+) -> Result<Vec<code::Function>> {
+    let n = module.functions.len();
+    // A fresh context per function spends the time in the allocator. One per
+    // thread, cleared between functions, keeps those buffers.
+    let compile_at = |i: usize, ctx: &mut Context, fb_ctx: &mut FunctionBuilderContext| {
+        ctx.clear();
+        let func = &module.functions[i];
+        verifier.function(func).context("invalid IR")?;
+        ctx.func.signature = syms.signature(&func.sig);
+        lower(syms, func, ctx, fb_ctx);
+        compile_one(isa, ctx, names, data_names).with_context(|| format!("compiling fn {}", func.name))
+    };
+    let workers = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    if n < PARALLEL_AT || workers == 1 {
+        let mut ctx = Context::new();
+        let mut fb_ctx = FunctionBuilderContext::new();
+        return (0..n).map(|i| compile_at(i, &mut ctx, &mut fb_ctx)).collect();
+    }
+    let workers = workers.min(n);
+    let next = AtomicUsize::new(0);
+    let mut parts = Vec::new();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            handles.push(
+                std::thread::Builder::new()
+                    .name("athrad-codegen".into())
+                    .stack_size(8 << 20)
+                    .spawn_scoped(scope, || {
+                        let mut ctx = Context::new();
+                        let mut fb_ctx = FunctionBuilderContext::new();
+                        let mut local = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= n {
+                                break;
+                            }
+                            local.push((i, compile_at(i, &mut ctx, &mut fb_ctx)));
+                        }
+                        local
+                    })
+                    .expect("spawning a codegen thread"),
+            );
+        }
+        for handle in handles {
+            parts.push(handle.join().unwrap_or_else(|e| std::panic::resume_unwind(e)));
+        }
+    });
+    let mut slots: Vec<Option<Result<code::Function>>> = (0..n).map(|_| None).collect();
+    for part in parts {
+        for (i, compiled) in part {
+            slots[i] = Some(compiled);
+        }
+    }
+    slots.into_iter().map(|slot| slot.expect("every function was compiled")).collect()
+}
+
+/// Compile the function in `ctx`: its bytes, its relocations with symbols
+/// by name, and its unwind info.
 fn compile_one(
     isa: &dyn cranelift_codegen::isa::TargetIsa,
     ctx: &mut Context,
     names: &HashMap<u32, &str>,
     data_names: &HashMap<u32, &str>,
-) -> Result<cache::Entry> {
+) -> Result<code::Function> {
     let code = ctx
         .compile(isa, &mut cranelift_codegen::control::ControlPlane::default())
         .map_err(|e| anyhow!("{:?}", e.inner))?;
@@ -228,14 +257,14 @@ fn compile_one(
     for r in code.buffer.relocs() {
         let m = ModuleReloc::from_mach_reloc(r, &ctx.func, FuncId::from_u32(0));
         let target = match m.name {
-            ModuleRelocTarget::User { namespace: 0, index } => cache::Target::Func(names[&index].to_owned()),
-            ModuleRelocTarget::User { namespace: 1, index } => cache::Target::Data(data_names[&index].to_owned()),
+            ModuleRelocTarget::User { namespace: 0, index } => code::Target::Func(names[&index].to_owned()),
+            ModuleRelocTarget::User { namespace: 1, index } => code::Target::Data(data_names[&index].to_owned()),
             ModuleRelocTarget::User { namespace, .. } => bail!("relocation in namespace {namespace}"),
-            ModuleRelocTarget::LibCall(l) => cache::Target::LibCall(l),
-            ModuleRelocTarget::KnownSymbol(k) => cache::Target::Known(k),
-            ModuleRelocTarget::FunctionOffset(_, o) => cache::Target::SelfOffset(o),
+            ModuleRelocTarget::LibCall(l) => code::Target::LibCall(l),
+            ModuleRelocTarget::KnownSymbol(k) => code::Target::Known(k),
+            ModuleRelocTarget::FunctionOffset(_, o) => code::Target::SelfOffset(o),
         };
-        relocs.push(cache::CachedReloc { offset: m.offset, kind: m.kind, target, addend: m.addend });
+        relocs.push(code::RelocEntry { offset: m.offset, kind: m.kind, target, addend: m.addend });
     }
     let mut call_sites = Vec::new();
     for site in code.buffer.call_sites() {
@@ -245,27 +274,83 @@ fn compile_one(
                 pad = Some((cranelift_codegen::entity::EntityRef::index(*tag) as u32 == TAG_CATCH, at.as_offset()));
             }
         }
-        call_sites.push(cache::CallSite { ret_addr: site.ret_addr, pad });
+        call_sites.push(code::CallSite { ret_addr: site.ret_addr, pad });
     }
     // Only a function with a landing pad needs its call sites listed.
     if call_sites.iter().all(|c| c.pad.is_none()) {
         call_sites.clear();
     }
-    Ok(cache::Entry { align, code: code.buffer.data().to_vec(), relocs, unwind, call_sites })
+    Ok(code::Function { align, code: code.buffer.data().to_vec(), relocs, unwind, call_sites })
 }
 
-/// A function's reference in the function being built, declared once.
-fn func_ref_for<'a>(
-    obj: &mut ObjectModule,
-    b: &mut FunctionBuilder,
-    funcs: &mut HashMap<&'a str, clif::FuncRef>,
-    ids: &HashMap<&'a str, Id>,
-    name: &str,
-) -> clif::FuncRef {
-    let (key, id) = ids.get_key_value(name).expect("verified IR");
-    *funcs.entry(*key).or_insert_with(|| {
-        let Id::Func(id) = *id else { unreachable!("verified IR: `{name}` is a function") };
-        obj.declare_func_in_func(id, b.func)
+/// A declared symbol, as lowering needs it. `colocated` is Cranelift's
+/// `Linkage::is_final`: a direct reference, rather than one through the GOT.
+struct Sym<'a> {
+    id: Id,
+    ir_sig: Option<&'a ir::Signature>,
+    clif_sig: Option<clif::Signature>,
+    colocated: bool,
+    tls: bool,
+}
+
+struct Syms<'a> {
+    by_name: HashMap<&'a str, Sym<'a>>,
+    call_conv: CallConv,
+    target_config: cranelift_codegen::isa::TargetFrontendConfig,
+}
+
+impl<'a> Syms<'a> {
+    fn signature(&self, sig: &ir::Signature) -> clif::Signature {
+        signature(self.call_conv, sig)
+    }
+
+    fn ir_sig(&self, name: &str) -> &'a ir::Signature {
+        self.by_name[name].ir_sig.expect("verified IR: a function")
+    }
+
+    fn func_ref(
+        &self,
+        b: &mut FunctionBuilder,
+        funcs: &mut HashMap<&'a str, clif::FuncRef>,
+        name: &str,
+    ) -> clif::FuncRef {
+        let (key, sym) = self.by_name.get_key_value(name).expect("verified IR");
+        *funcs.entry(*key).or_insert_with(|| import_func(sym, b.func))
+    }
+
+    fn data_gv(
+        &self,
+        b: &mut FunctionBuilder,
+        globals: &mut HashMap<&'a str, clif::GlobalValue>,
+        name: &str,
+    ) -> clif::GlobalValue {
+        let (key, sym) = self.by_name.get_key_value(name).expect("verified IR");
+        *globals.entry(*key).or_insert_with(|| import_data(sym, b.func))
+    }
+}
+
+/// What [`cranelift_module::Module::declare_func_in_func`] records, without
+/// the module: the functions of one module are lowered at the same time.
+fn import_func(sym: &Sym<'_>, func: &mut clif::Function) -> clif::FuncRef {
+    let Id::Func(id) = sym.id else { unreachable!("verified IR: a function") };
+    let signature = func.import_signature(sym.clif_sig.clone().expect("a function signature"));
+    let user = func.declare_imported_user_function(clif::UserExternalName { namespace: 0, index: id.as_u32() });
+    func.import_function(clif::ExtFuncData {
+        name: clif::ExternalName::user(user),
+        signature,
+        colocated: sym.colocated,
+        patchable: false,
+    })
+}
+
+fn import_data(sym: &Sym<'_>, func: &mut clif::Function) -> clif::GlobalValue {
+    let Id::Data(id) = sym.id else { unreachable!("verified IR: data") };
+    let user = func.declare_imported_user_function(clif::UserExternalName { namespace: 1, index: id.as_u32() });
+    func.create_global_value(clif::GlobalValueData::Symbol {
+        name: clif::ExternalName::user(user),
+        offset: clif::immediates::Imm64::new(0),
+        colocated: sym.colocated,
+        tls: sym.tls,
     })
 }
 
@@ -292,6 +377,11 @@ fn linkage(l: ir::Linkage) -> Linkage {
 fn host_isa() -> Result<OwnedTargetIsa> {
     let mut flags = settings::builder();
     flags.set("opt_level", "none")?;
+    // Cranelift's verifier walks the IR it was just given and does not change
+    // the machine code. The module was already checked before this.
+    flags.set("enable_verifier", "false")?;
+    // `backtracking` spends its time on code quality a dev build does not use.
+    flags.set("regalloc_algorithm", "single_pass")?;
     flags.set("preserve_frame_pointers", "true")?;
     // Pass i128 the way LLVM does, which is how rustc's code expects it.
     flags.set("enable_llvm_abi_extensions", "true")?;
@@ -368,21 +458,14 @@ fn abi_param(p: &ir::Param) -> AbiParam {
     }
 }
 
-fn signature(obj: &ObjectModule, sig: &ir::Signature) -> clif::Signature {
-    let mut s = obj.make_signature();
+fn signature(call_conv: CallConv, sig: &ir::Signature) -> clif::Signature {
+    let mut s = clif::Signature::new(call_conv);
     s.params.extend(sig.params.iter().map(abi_param));
     s.returns.extend(sig.returns.iter().map(abi_param));
     s
 }
 
-fn lower(
-    obj: &mut ObjectModule,
-    ids: &HashMap<&str, Id>,
-    sigs: &HashMap<&str, &ir::Signature>,
-    func: &ir::Function,
-    ctx: &mut Context,
-    fb_ctx: &mut FunctionBuilderContext,
-) {
+fn lower(syms: &Syms<'_>, func: &ir::Function, ctx: &mut Context, fb_ctx: &mut FunctionBuilderContext) {
     let mut b = FunctionBuilder::new(&mut ctx.func, fb_ctx);
 
     let blocks: Vec<clif::Block> = func.blocks.iter().map(|_| b.create_block()).collect();
@@ -422,12 +505,8 @@ fn lower(
         b.switch_to_block(blocks[i]);
         let get = |values: &[Option<clif::Value>], v: ir::Value| values[v.0 as usize].expect("verified IR");
         for inst in &block.insts {
-            let mut func_ref = |b: &mut FunctionBuilder, name: &str| -> clif::FuncRef {
-                *funcs.entry(ids.get_key_value(name).expect("verified IR").0).or_insert_with(|| {
-                    let Id::Func(id) = ids[name] else { unreachable!("verified IR: `{name}` is a function") };
-                    obj.declare_func_in_func(id, b.func)
-                })
-            };
+            let mut func_ref =
+                |b: &mut FunctionBuilder, name: &str| -> clif::FuncRef { syms.func_ref(b, &mut funcs, name) };
             let results: Vec<clif::Value> = match &inst.op {
                 ir::Op::Const(ty, n) => vec![iconst(&mut b, *ty, *n)],
                 ir::Op::Binary(op @ (ir::BinOp::UDiv | ir::BinOp::URem | ir::BinOp::SDiv | ir::BinOp::SRem), x, y)
@@ -513,23 +592,18 @@ fn lower(
                 ir::Op::SExt(ty, v) => vec![b.ins().sextend(clif_type(*ty), get(&values, *v))],
                 ir::Op::Trunc(ty, v) => vec![b.ins().ireduce(clif_type(*ty), get(&values, *v))],
                 ir::Op::SlotAddr(s) => vec![b.ins().stack_addr(types::I64, slots[s.0 as usize], 0)],
-                ir::Op::SymbolAddr(name) => match ids[name.as_str()] {
+                ir::Op::SymbolAddr(name) => match syms.by_name[name.as_str()].id {
                     Id::Func(_) => {
                         let f = func_ref(&mut b, name);
                         vec![b.ins().func_addr(types::I64, f)]
                     }
-                    Id::Data(id) => {
-                        let gv = *globals
-                            .entry(ids.get_key_value(name.as_str()).unwrap().0)
-                            .or_insert_with(|| obj.declare_data_in_func(id, b.func));
+                    Id::Data(_) => {
+                        let gv = syms.data_gv(&mut b, &mut globals, name);
                         vec![b.ins().symbol_value(types::I64, gv)]
                     }
                 },
                 ir::Op::TlsAddr(name) => {
-                    let Id::Data(id) = ids[name.as_str()] else { unreachable!("verified IR: `{name}` is data") };
-                    let gv = *globals
-                        .entry(ids.get_key_value(name.as_str()).unwrap().0)
-                        .or_insert_with(|| obj.declare_data_in_func(id, b.func));
+                    let gv = syms.data_gv(&mut b, &mut globals, name);
                     vec![b.ins().tls_value(types::I64, gv)]
                 }
                 ir::Op::Load(ty, addr, offset) => {
@@ -575,7 +649,7 @@ fn lower(
                 }
                 ir::Op::Call(name, args) => {
                     let callee = func_ref(&mut b, name);
-                    let sig = sigs[name.as_str()];
+                    let sig = syms.ir_sig(name);
                     let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
                     let args = abi_values(&mut b, &sig.params, &args, true);
                     let call = b.ins().call(callee, &args);
@@ -583,7 +657,7 @@ fn lower(
                     abi_values(&mut b, &sig.returns, &results, false)
                 }
                 ir::Op::CallIndirect(sig, callee, args) => {
-                    let clif_sig = b.import_signature(signature(obj, sig));
+                    let clif_sig = b.import_signature(syms.signature(sig));
                     let args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
                     let args = abi_values(&mut b, &sig.params, &args, true);
                     let call = b.ins().call_indirect(clif_sig, get(&values, *callee), &args);
@@ -694,12 +768,12 @@ fn lower(
             }
             ir::Terminator::TryCall { callee, args, normal, unwind, catch } => {
                 let (sig, target) = match callee {
-                    ir::Callee::Direct(name) => (sigs[name.as_str()].clone(), None),
+                    ir::Callee::Direct(name) => (syms.ir_sig(name).clone(), None),
                     ir::Callee::Indirect(sig, ptr) => (sig.clone(), Some(get(&values, *ptr))),
                 };
                 let call_args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
                 let call_args = abi_values(&mut b, &sig.params, &call_args, true);
-                let sig_ref = b.import_signature(signature(obj, &sig));
+                let sig_ref = b.import_signature(syms.signature(&sig));
                 // Returns arrive as the calling convention passes them; a
                 // block of our own turns floats back into integers.
                 let ret_block = b.create_block();
@@ -718,7 +792,7 @@ fn lower(
                 ));
                 match (callee, target) {
                     (ir::Callee::Direct(name), _) => {
-                        let f = func_ref_for(obj, &mut b, &mut funcs, ids, name);
+                        let f = syms.func_ref(&mut b, &mut funcs, name);
                         b.ins().try_call(f, &call_args, table);
                     }
                     (_, Some(ptr)) => {
@@ -740,7 +814,7 @@ fn lower(
     }
 
     b.seal_all_blocks();
-    b.finalize(obj.target_config());
+    b.finalize(syms.target_config);
 }
 
 /// 128-bit division and remainder. Cranelift has no 128-bit divide, and

@@ -15,11 +15,11 @@
 //! to `rustc`, as every program did before, and `rustc` compiles it or
 //! reports the error. This frontend never writes a diagnostic.
 //!
-//! The programs it compiles link with a runtime Athrad builds once with
-//! `rustc` (see `athrad::runtime`): `std`, `lang_start`, the C `main`, and
-//! the `print!` helpers this frontend calls. What it needs to know about the
-//! pinned `std`, which panic functions to call and how a `Location` is laid
-//! out, comes from there too, as an [`Abi`].
+//! The programs it compiles link with a runtime built into Athrad (see
+//! `athrad::runtime`): `std`, `lang_start`, the C `main`, and the `print!`
+//! helpers this frontend calls. What it needs to know about the pinned
+//! `std`, which panic functions to call and how a `Location` is laid out,
+//! comes from there too, as an [`Abi`].
 
 mod check;
 mod lint;

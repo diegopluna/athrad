@@ -22,7 +22,6 @@ pub(crate) struct ModCx<'tcx> {
     /// Data symbols referred to that may live in another crate.
     datas: Vec<String>,
     allocs: HashMap<AllocId, String>,
-    writable_allocs: usize,
     /// Which drops a panic may skip; see `unwind.rs`.
     pub(crate) skippable: crate::unwind::Skippable<'tcx>,
     /// The concrete type and principal trait of every vtable the program
@@ -47,7 +46,6 @@ impl<'tcx> ModCx<'tcx> {
             funcs: HashMap::new(),
             datas: Vec::new(),
             allocs: HashMap::new(),
-            writable_allocs: 0,
             skippable: Default::default(),
             vtables: Vec::new(),
             thread_locals: Default::default(),
@@ -109,9 +107,7 @@ impl<'tcx> ModCx<'tcx> {
 
     /// The data symbol holding a memory allocation, defined on first use.
     /// The symbol of a constant allocation. Its name comes from its contents,
-    /// so it stays the same from build to build whatever else changes, and
-    /// so do the functions that refer to it, which keeps their cached
-    /// machine code good. Equal immutable allocations share one symbol.
+    /// so equal immutable allocations share one symbol.
     fn alloc_symbol(&mut self, alloc_id: AllocId) -> Result<String> {
         if let Some(name) = self.allocs.get(&alloc_id) {
             if name.is_empty() {
@@ -137,9 +133,10 @@ impl<'tcx> ModCx<'tcx> {
         let digest = sha2::Digest::finalize(h);
         let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
         let name = if data.writable {
-            // Each mutable allocation is its own, however alike.
-            self.writable_allocs += 1;
-            format!("__athrad_alloc_{hex}_{}", self.writable_allocs)
+            // A mutable allocation is its own, however alike its bytes are.
+            // The id, not a counter, so two threads lowering the same one
+            // agree on its symbol.
+            format!("__athrad_alloc_{hex}_{}", alloc_id.0)
         } else {
             format!("__athrad_alloc_{hex}")
         };

@@ -188,7 +188,7 @@ Done, and green on all three hosts. The `subset` crate is a lexer, a parser, a t
 
 `subset/src/lib.rs` has tests of programs that must fall back. Columns in panic locations are `rustc`'s display columns, so a file with tabs or non-ASCII text also falls back.
 
-**`std` without `rustc`.** The programs `subset` compiles link with a runtime: a small Rust program (`athrad::runtime::SOURCE`) that Athrad builds once with `rustc` as the frontend, kept in `.athrad/runtime/` with a stamp of the Athrad that built it. It provides the C `main`, `lang_start`, and the allocator shim; its `main` calls `athrad_user_main`, which `subset`'s object defines. It also provides `print!` helpers, so output goes through `std`'s own stdout and stderr. Building it also reads what `subset` needs to know about the pinned `std` from `rustc` (`frontend::StdAbi`): the symbols of `core`'s panic functions, and the layout of `core::panic::Location`. So an overflow panic calls the same `core` function `rustc`'s code calls, with the same location.
+**`std` without `rustc`.** The programs `subset` compiles link with a runtime: a small Rust program (`athrad::runtime::SOURCE`) compiled when Athrad itself is built, and shipped inside the compiler. It provides the C `main`, `lang_start`, and the allocator shim; its `main` calls `athrad_user_main`, which `subset`'s object defines. It also provides `print!` helpers, so output goes through `std`'s own stdout and stderr. Building it also reads what `subset` needs to know about the pinned `std` from `rustc` (`frontend::StdAbi`): the symbols of `core`'s panic functions, and the layout of `core::panic::Location`. So an overflow panic calls the same `core` function `rustc`'s code calls, with the same location.
 
 **The oracle.** Every program is built a second time with `subset` allowed, and `subset_*.rs` (control flow, 128-bit values, casts, printing, and a program for each of the ten panics), `add.rs`, `print_edges.rs`, and `overflow.rs` must not fall back. The first run caught a real difference: `rustc` builds `-170141183460469231731687303715884105728i128` as a constant, while `subset` negated at run time and panicked.
 
@@ -211,7 +211,7 @@ A survey built 35 popular crates without proc macros of their own (regex, memchr
 * **SIMD.** The `simd_*` intrinsics are lowered lane by lane in memory, and so are the LLVM intrinsics `core::arch` declares as foreign functions (NEON pairwise and across-lane operations, `tbl1`, `pmovmskb`, `pshufb`, barriers). This is slow and exact.
 * **Atomics, thread-locals (Cranelift's TLS models per host), C-variadic calls** (std calls `fcntl`; Apple's arm64 ABI puts variadic arguments on the stack), **smart-pointer unsizing** (`Arc<T>` to `Arc<dyn Trait>`), `Location::caller`, wide-pointer comparisons.
 * **Proc macros run only inside the compiler**, so the backend hands proc-macro crates to `rustc`'s own LLVM backend, which it wraps. Build scripts are compiled by Athrad.
-* Work products are keyed by the code generator's build id, so objects an older Athrad made are never reused.
+* Nothing from an earlier build of the crate is reused. `-C incremental` is ignored, and every function is compiled again.
 
 **The gap: Windows has no landing pads.** Rust on MSVC unwinds with SEH and C++-style funclets, which Cranelift cannot express. On Windows, Athrad still skips cleanups where that cannot be seen and rejects the rest, so it rejects anything with a `Drop` that a panic could run, `catch_unwind`, and threads. Programs and projects that need landing pads are marked `may-reject-on-windows`: there they may be rejected, never miscompiled. Closing the gap means building cleanups as SEH `__finally`-style handlers (`__C_specific_handler` scope tables in `.xdata`, with the cleanup code reachable from the handler), or catching in an `__except` filter, cleaning up in the frame, and raising the exception again. Both need design work before code. Until then, Windows accepts fewer programs than Linux and macOS.
 
@@ -251,3 +251,41 @@ Where a warm one-file edit goes, inside the process (`ATHRAD_TIME=1`, the edited
 | `big.rs` | 97 ms | 9 ms | 4 ms | 42 ms | 152 ms |
 
 The wall-clock table is that, plus starting the process (about 25 ms) or, for `athrad watch`, noticing the save (about 15 ms). The link is still the floor on a small file. On `heap.rs` and `big.rs`, `rustc`'s frontend is the larger piece.
+
+That split is the warm function cache. The next section is the same programs with nothing kept from the previous build.
+
+### The edit loop, with nothing kept
+
+The per-function code cache, `rustc`'s incremental units, and the on-disk subset runtime are gone. `athrad watch` still stays up, so the process does not start again and the linker command is already known, and each build compiles the file again. Once a crate has eight functions they compile together, one thread per core, and each of those threads keeps one Cranelift context and clears it between functions. Cranelift uses its fast register allocator, and its own verifier is off: the IR was already checked, and the check does not change the machine code.
+
+`rustc` walks the monomorphization graph on one thread, because a binary's only root is `main`. The queries that walk reads do not depend on the order of the walk, so Athrad evaluates them on the pool first. The memo lives for this compile. The walk still decides the item set, and a static is still visited there. Doing the same work by splitting the frontier for the pool to steal, instead of one wave per depth, measured the same 42 ms on `big.rs`: that time is the queries. Mangling and the size estimate run on the core that just scanned the body, which is when the partition would have asked. `scripts/edit_loop.py`, median of 10, same machine and method as the tables above.
+
+| Program | `cargo build` | `cargo build --release` | `athrad` | `athrad watch` |
+|---|---|---|---|---|
+| `add.rs` | 127 ms | 126 ms | 61 ms | 45 ms |
+| `subset_flow.rs` | 142 ms | 146 ms | 61 ms | 44 ms |
+| `heap.rs` | 173 ms | 229 ms | 103 ms | 78 ms |
+| `traits.rs` | 149 ms | 154 ms | 86 ms | 68 ms |
+| `big.rs` | 265 ms | 1,710 ms | 310 ms | 265 ms |
+
+| Project | `cargo build` | `cargo build --release` | `athrad build` |
+|---|---|---|---|
+| `shapes`, edit in the binary crate | 155 ms | 181 ms | 139 ms |
+| `shapes`, edit in the library | 211 ms | 235 ms | 179 ms |
+| `big.rs` as a package | 264 ms | 1,723 ms | 358 ms |
+| `popular`, edit in the binary | 421 ms | 918 ms | 309 ms |
+
+On a small file, compiling everything is cheaper than the bookkeeping that used to skip it. `heap.rs` in `athrad watch` is 78 ms, against 103 ms with the cache warm. `traits.rs` is 68 ms, against 93 ms. `shapes` moved the same way: 139 ms and 179 ms, against 173 ms and 217 ms.
+
+`big.rs` matches `cargo build`. All 7,373 functions are compiled on every edit. `athrad watch` is 265 ms, and `cargo build` is 265 ms. The same watch was 350 ms when the monomorphization queries ran on one thread, and 168 ms when their machine code was kept. `cargo build --release` on that file is still 1.7 s. One-shot `athrad` is 310 ms because the process starts and the link goes through the C driver. `athrad watch` is already running and already resolved that driver down to `ld`. The package form is 358 ms, against 264 ms for `cargo build`: `athrad build` is started by Cargo and linked through that same C driver. `popular` is 309 ms, ahead of `cargo build` at 421 ms.
+
+Where one build goes, inside the process (`ATHRAD_TIME=1`, the middle of 3 runs, nothing reused):
+
+| Program | `rustc` | lower | codegen | link | total |
+|---|---|---|---|---|---|
+| `add.rs` | — | 0.0 ms, its own frontend | 0.5 ms (2 functions) | 36 ms | 37 ms |
+| `heap.rs` | 32 ms | 4 ms | 5 ms (361) | 36 ms | 77 ms |
+| `traits.rs` | 20 ms | 3 ms | 2 ms (90) | 37 ms | 61 ms |
+| `big.rs` | 134 ms | 37 ms | 69 ms (7,373) | 43 ms | 283 ms |
+
+The wall clock is that, plus starting the process, or for `athrad watch` noticing the save. On `big.rs` the 134 ms is `rustc`: the crate's analysis, and the monomorphization queries. After those queries the walk itself is a few milliseconds. Cranelift is 69 ms. The link is still the floor on a small file, about 36 ms.

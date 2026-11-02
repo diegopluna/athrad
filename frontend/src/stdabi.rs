@@ -1,8 +1,8 @@
 //! What Athrad's own frontend (the `subset` crate) needs to know about the
 //! pinned `std` to compile without `rustc`: the panic functions overflow and
 //! division checks call, and how a `core::panic::Location` is laid out.
-//! Read from `rustc` once, when Athrad builds the runtime the subset's
-//! programs link with.
+//! Read from `rustc` when Athrad itself is built, and shipped inside the
+//! runtime the subset's programs link with.
 
 use rustc_abi::FieldIdx;
 use rustc_hir::LangItem;

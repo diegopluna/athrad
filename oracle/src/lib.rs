@@ -117,8 +117,8 @@ pub fn check(program: &Program, work_dir: &Path) -> Result<Agreement> {
 
 /// Like [`check`], with Athrad's own frontend allowed to build the program
 /// (it falls back to `rustc` for anything outside its subset). Returns
-/// whether it did, with the agreement. The runtime it links with is built
-/// once in `work_dir/runtime`.
+/// whether it did, with the agreement. The runtime it links with is the one
+/// built into the compiler.
 pub fn check_subset(program: &Program, work_dir: &Path) -> Result<(Agreement, bool)> {
     let name = &program.name;
     let dir = work_dir.join("subset").join(name);
@@ -128,9 +128,7 @@ pub fn check_subset(program: &Program, work_dir: &Path) -> Result<(Agreement, bo
     let rustc_exe = build_with_rustc(name, &src, &dir.join("rustc"))?;
     let exe = dir.join("athrad").join(link::executable_name(name));
     std::fs::create_dir_all(dir.join("athrad"))?;
-    let mut caches = athrad::Caches { runtime: Some(work_dir.join("runtime")), ..Default::default() };
-    let t = athrad::build_cached(&src, linker()?, &mut caches, &dir.join("work"), &exe)
-        .map_err(|e| Rejected(format!("{e:#}")))?;
+    let t = athrad::build_one_file(&src, linker()?, &dir.join("work"), &exe).map_err(|e| Rejected(format!("{e:#}")))?;
     let (rustc, athrad) = (run(&rustc_exe)?, run(&exe)?);
     if rustc != athrad {
         let how = if t.subset { "Athrad's own frontend" } else { "Athrad" };
@@ -180,20 +178,12 @@ pub fn edits(program: &Program) -> Result<Vec<Vec<(String, String)>>> {
     Ok(out)
 }
 
-/// What [`check_edits`] saw Athrad reuse, over the rebuilds after edits.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Reuse {
-    pub builds: usize,
-    pub reused_units: usize,
-    pub cached_functions: usize,
-    pub compiled_functions: usize,
-}
-
 /// The edit loop under the oracle: build `program`, then make each of its
 /// [`edits`] in turn (each to the first line of code with its `FROM`), and
-/// rebuild with Athrad's caches warm from the build before. Every build must
-/// agree with `rustc`'s build of the same text.
-pub fn check_edits(program: &Program, work_dir: &Path) -> Result<Reuse> {
+/// rebuild. Every build compiles the crate again and must agree with
+/// `rustc`'s build of the same text. This uses `rustc` as the frontend, so
+/// the edit loop is checked even for programs Athrad's own frontend covers.
+pub fn check_edits(program: &Program, work_dir: &Path) -> Result<()> {
     let name = &program.name;
     let edits = edits(program)?;
     let dir = work_dir.join(format!("{name}-edits"));
@@ -201,8 +191,6 @@ pub fn check_edits(program: &Program, work_dir: &Path) -> Result<Reuse> {
     std::fs::create_dir_all(dir.join("src"))?;
     let src = dir.join("src").join(format!("{name}.rs"));
     let mut lines: Vec<String> = std::fs::read_to_string(&program.path)?.lines().map(str::to_owned).collect();
-    let mut caches = athrad::Caches { code: Default::default(), incremental: Some(dir.join("incr")), runtime: None };
-    let mut reuse = Reuse::default();
     for step in 0..=edits.len() {
         if step > 0 {
             for (from, to) in &edits[step - 1] {
@@ -217,20 +205,14 @@ pub fn check_edits(program: &Program, work_dir: &Path) -> Result<Reuse> {
         let rustc_exe = build_with_rustc(name, &src, &dir.join("rustc"))?;
         let exe = dir.join("athrad").join(link::executable_name(name));
         std::fs::create_dir_all(dir.join("athrad"))?;
-        let t = athrad::build_cached(&src, linker()?, &mut caches, &dir.join("work"), &exe)
+        athrad::build(&src, linker()?, &dir.join("work"), &exe)
             .with_context(|| format!("athrad failed on `{name}` after edit {step}"))?;
-        if step > 0 {
-            reuse.builds += 1;
-            reuse.reused_units += t.reused_units;
-            reuse.cached_functions += t.cache.hits;
-            reuse.compiled_functions += t.cache.misses;
-        }
         let (rustc, athrad) = (run(&rustc_exe)?, run(&exe)?);
         if rustc != athrad {
             bail!("`{name}` after edit {step}: Athrad disagrees with rustc\nrustc:\n{rustc}\nathrad:\n{athrad}");
         }
     }
-    Ok(reuse)
+    Ok(())
 }
 
 /// Compile with `rustc` as `cargo build` would for a debug binary.
@@ -351,7 +333,7 @@ pub fn crates() -> Result<Vec<Crate>> {
 /// build` (the `athrad` executable at `athrad`), run the binary each makes,
 /// and fail unless they agree. Then make each edit in the project's `edits`
 /// file in turn (`FILE: FROM ==> TO`), rebuilding both and comparing again,
-/// so Athrad's incremental rebuilds across crates are checked too. Returns
+/// so each edit's rebuild agrees too. Returns
 /// how many builds agreed.
 pub fn check_crate(krate: &Crate, athrad: &Path, work_dir: &Path) -> Result<usize> {
     let dir = work_dir.join("crates").join(&krate.name);

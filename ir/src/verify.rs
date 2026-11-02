@@ -31,9 +31,7 @@ pub fn verify(module: &Module) -> Result<(), VerifyError> {
     Ok(())
 }
 
-/// A module's symbols, checked; functions are checked one at a time, so a
-/// caller that knows a function is unchanged since it was last checked (its
-/// code is cached by its IR's hash) can skip it.
+/// A module's symbols, checked. Functions are checked one at a time.
 pub struct Verifier<'a> {
     symbols: HashMap<&'a str, Symbol<'a>>,
 }

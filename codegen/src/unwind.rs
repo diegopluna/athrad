@@ -27,7 +27,7 @@ pub struct Entry {
     pub func: FuncId,
     pub info: UnwindInfo,
     pub size: u32,
-    pub call_sites: Vec<crate::cache::CallSite>,
+    pub call_sites: Vec<crate::code::CallSite>,
 }
 
 /// Address symbols at or above this are `extra` symbols, not functions.
@@ -235,7 +235,7 @@ fn personality_cie(
 /// pad (0 for none: unwinding goes on) and action (0 to clean up, 1 for the
 /// catch-all action that `catch_unwind` needs). Without a type table:
 /// `rust_eh_personality` treats any non-zero type filter as a catch.
-fn lsda(sites: &[crate::cache::CallSite]) -> Vec<u8> {
+fn lsda(sites: &[crate::code::CallSite]) -> Vec<u8> {
     let uleb = |out: &mut Vec<u8>, mut v: u64| loop {
         let byte = (v & 0x7f) as u8;
         v >>= 7;
@@ -245,7 +245,7 @@ fn lsda(sites: &[crate::cache::CallSite]) -> Vec<u8> {
         }
         out.push(byte | 0x80);
     };
-    let mut sites: Vec<&crate::cache::CallSite> = sites.iter().collect();
+    let mut sites: Vec<&crate::code::CallSite> = sites.iter().collect();
     sites.sort_by_key(|s| s.ret_addr);
     let mut table = Vec::new();
     for s in &sites {

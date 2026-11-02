@@ -1,6 +1,5 @@
 // The oracle builds this program, then makes each edit below in turn and
-// rebuilds with Athrad's caches warm (rustc's incremental state, the
-// per-function code cache), checking every build against rustc.
+// rebuilds, checking every build against rustc.
 //
 // edit: let base = 10; => let base = 11;
 // edit: a.wrapping_mul(31) => a.wrapping_mul(37)

@@ -19,7 +19,7 @@ link = { path = "link" }
 athrad = { path = "athrad" }
 anyhow = "1"
 cc = "1.10"
-cranelift-codegen = { version = "0.137.1", features = ["enable-serde"] }
+cranelift-codegen = "0.137.1"
 cranelift-frontend = "0.137.1"
 cranelift-module = "0.137.1"
 cranelift-native = "0.137.1"
