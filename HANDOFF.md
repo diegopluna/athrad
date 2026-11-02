@@ -96,7 +96,7 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-Milestones 0, 1, and 2 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
+Milestones 0 through 3 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
 
 `athrad FILE.rs [-o OUT]` builds a one-file binary crate as `rustc --edition 2024 FILE.rs` would, and the oracle checks 17 programs that way: arithmetic and overflow panics, loops and recursion, structs, enums and `match`, `Option`/`Result`, `Vec`, `String`, `Box`, sorting, iterators and closures, generics, trait objects, `f32`/`f64` with their edge cases, `i128`/`u128`, bounds-check and `unwrap`/`expect`/`panic!` panics, `ExitCode`, a generated 1,800-line program, and a series of edits.
 
@@ -112,7 +112,7 @@ The pipeline:
 * `frontend` (a sixth crate): MIR → IR, after `rustc_codegen_cranelift` (the 1.98.1 source is the map). Every local lives in a stack slot; values move as scalars, scalar pairs, or addresses, as `rustc`'s layouts and calling conventions say. Blocks a constant `switchInt` rules out after monomorphization are traps, as `rustc` skips them.
 * `ir`: integers `i8`–`i128`, stack slots, loads and stores, data with relocations, symbol addresses, direct and indirect calls with multiple results, overflow-checked arithmetic, bit operations, and floats. A float is the integer of its bits; float operations say it is one, and ABI parameters carry a float flag.
 * `codegen`: Cranelift 0.137, `opt_level=none`, frame pointers, LLVM's `i128` ABI. It writes unwind tables itself: `.eh_frame` on ELF and Mach-O, `.pdata`/`.xdata` on COFF. `i128` division is inline, because compiler-builtins passes `i128` differently on each OS.
-* `link`: unchanged seams. Upstream `raw-dylib` imports (Windows `std`) are already in the rlib.
+* `link`: unchanged seams. Upstream `raw-dylib` imports (Windows `std`) are already in the rlib. Under Cargo, `rustc` links instead (milestone 3).
 * `oracle`: programs are only Rust source now, in `oracle/programs` (must agree) and `oracle/programs/later` (may be rejected, must never disagree). Thread ids in panic messages are masked, and both binaries run without `RUST_BACKTRACE`.
 
 Not yet, and what happens instead:
@@ -159,4 +159,26 @@ Where an edit's time goes now (`heap.rs`, `athrad`): `rustc` 40 ms (parsing, inc
 * On macOS the linker's floor is 19 ms (`ld` on an empty program) and the driver adds 11 ms. A faster linker is the next lever, and rule 4's profile now says so. `rust-lld` cannot link on macOS 27: it cannot read the SDK's `libSystem.tbd`. Linking `std` as a dylib saved only 4 ms, so Athrad does not.
 * After the machine has been idle for a few hundred milliseconds, every build here (`cargo`'s, `rustc`'s, Athrad's) is slower: `heap.rs` in a warm `athrad watch` takes 66 ms back to back and about 85 ms with 400 ms between edits. The table is measured the way an edit happens, with pauses.
 
-Next is milestone 3: a crate with modules and `Cargo.toml`, then one plain library dependency.
+### Milestone 3: a crate, then one plain library dependency
+
+Done, and green on all three hosts. `athrad build` and `athrad run` take Cargo's arguments and run `cargo build` / `cargo run` with Athrad compiling every crate, the package's and its dependencies', from crates.io too. Cargo runs `athrad-driver` as its `RUSTC_WRAPPER`, and the output goes to `target/athrad`, so it never mixes with `rustc`'s.
+
+* **Two programs.** `athrad` is a small launcher that does not link the compiler, because `rustc_driver` takes 20 ms to load and a no-op `athrad build` should cost what `cargo build` does. `athrad-driver` holds the compiler, and serves both Cargo and the one-file commands.
+* **`rustc` links.** Driven by Cargo, the backend hands its objects to `rustc` as compiled modules, and `rustc` links them the way it does LLVM's: rlibs with their metadata for libraries, and the executable with every link argument Cargo and the crates give. Only the `lib` (rlib) and `bin` crate types are accepted; a proc-macro crate, or any crate Athrad cannot compile, is a `rustc` error that names why. Build scripts are compiled like any binary and are not tested.
+* **Caches per crate.** `rustc`'s incremental compilation works as in milestone 2 (Cargo passes `-C incremental` for workspace crates). The per-function code cache sits beside Cargo's incremental directory, one file per crate and `-C metadata`. Athrad's work products are filed under keys of their own (`athrad-o`, `athrad-facts`), so an incremental directory LLVM also wrote to never hands either backend the other's object.
+* **Skipped cleanups across crates.** A type now counts as the standard library's only if its crate is in the sysroot; a dependency's `Drop` impls are the program's. Each crate leaves its trait-object facts (vtables and the trait-object drops its cleanups would skip) beside its rlib or executable, and the executable checks all of them together. Cargo builds a binary only after its dependencies' rlibs are complete, so the facts are there.
+* **New in the IR's lowering:** `i128` multiplication overflow checks (`itoa` needs them).
+
+The oracle builds each project in `oracle/crates` with `cargo build` and with `athrad build` and compares the runs. `shapes` is a workspace with modules and a path dependency; its `edits` file has a series of edits across both crates (a library function body, a format string in a submodule, a new enum variant used in both crates, a renamed function). `numbers` uses `itoa` from crates.io. The test lives in `athrad/tests/crates.rs`, where Cargo builds the `athrad` binaries first.
+
+`scripts/edit_loop.py`, Cargo projects, median of 10 (same machine and method as above):
+
+| Project | `cargo build` | `athrad build` |
+|---|---|---|
+| `shapes`, edit in the binary crate | 164 ms | 172 ms |
+| `shapes`, edit in the library | 220 ms | 214 ms |
+| `big.rs` as a package | 270 ms | 235 ms |
+
+On a small project Athrad and `rustc` now cost the same, because both spend the time in the same places: Cargo, `rustc`'s frontend, and `rustc`'s link, which here is 45 ms of each edit. Athrad's own work is a few milliseconds. The one-file commands still link themselves and run `ld` without the C driver (11 ms less on macOS). Under Cargo, the way to do the same is to give `rustc` Athrad as its `-C linker`, running the command the driver would run; that, or `lld`, is the next lever.
+
+Next is milestone 4: a frontend of Athrad's own, for the subset the pipeline already runs.
