@@ -115,12 +115,7 @@ The pipeline:
 * `link`: unchanged seams. Upstream `raw-dylib` imports (Windows `std`) are already in the rlib. Under Cargo, `rustc` links instead (milestone 3).
 * `oracle`: programs are only Rust source now, in `oracle/programs` (must agree) and `oracle/programs/later` (may be rejected, must never disagree). Thread ids in panic messages are masked, and both binaries run without `RUST_BACKTRACE`.
 
-Not yet, and what happens instead:
-
-* **Landing pads.** A panic unwinds through Athrad's frames without running their cleanup. That is right only when nobody can tell, so Athrad rejects `catch_unwind` (and thread spawns, which use it): every panic then ends the process. It also rejects programs whose cleanup would run a destructor with an outside effect: the program's own `Drop` impls, `BufWriter`, and trait objects that may hold either. `oracle/programs/later/drops.rs` is the case. Real landing pads are Cranelift `try_call` plus an LSDA on ELF and Mach-O, as `rustc_codegen_cranelift` does; Windows needs SEH and has no answer yet, and Athrad must not accept on one OS what it rejects on another.
-* **SIMD.** `HashMap` reaches `core::arch` (NEON on aarch64, SSE2 on x86_64) through hashbrown; `simd_*` and `llvm.*` intrinsics are unsupported. `oracle/programs/later/hashmap.rs` is the case.
-* Thread-locals, atomics, inline and global assembly, `f16`/`f128`, `i128` multiplication overflow checks, C-variadic functions, and `link-arg`/local `raw-dylib` libraries are rejected with a message naming the construct.
-* No debug info, so backtraces are empty.
+Still open. There is no debug info, so backtraces are empty. Windows has no landing pads, so a program whose destructor would run during a panic is rejected there. Inline assembly (except Windows `std`'s `__fastfail`), defining C-variadic functions, `f16`/`f128`, and 128-bit atomics are rejected on every host. The coverage section below is the list of what landed after the milestones, including landing pads on Linux and macOS.
 
 ### Milestone 1 timings
 
@@ -221,3 +216,34 @@ A survey built 35 popular crates without proc macros of their own (regex, memchr
 **The gap: Windows has no landing pads.** Rust on MSVC unwinds with SEH and C++-style funclets, which Cranelift cannot express. On Windows, Athrad still skips cleanups where that cannot be seen and rejects the rest, so it rejects anything with a `Drop` that a panic could run, `catch_unwind`, and threads. Programs and projects that need landing pads are marked `may-reject-on-windows`: there they may be rejected, never miscompiled. Closing the gap means building cleanups as SEH `__finally`-style handlers (`__C_specific_handler` scope tables in `.xdata`, with the cleanup code reachable from the handler), or catching in an `__except` filter, cleaning up in the frame, and raising the exception again. Both need design work before code. Until then, Windows accepts fewer programs than Linux and macOS.
 
 Still rejected everywhere: inline assembly (except Windows `std`'s `__fastfail`), defining C-variadic functions, `f16`/`f128`, 128-bit atomics, `raw-dylib` in the crate being built, crate types other than `bin`, `lib`, and `proc-macro`.
+
+### After coverage: the edit loop
+
+Re-measured after landing pads and the rest of that work. `scripts/edit_loop.py`, median of 10, same machine and method as the tables above. One literal flipped back and forth, both caches warm. One-file builds were run afterwards and matched `cargo build`'s binary every time. `popular` is `oracle/crates/popular`, one binary crate on 24 crates.io libraries.
+
+| Program | `cargo build` | `athrad` | `athrad watch` |
+|---|---|---|---|
+| `add.rs` | 138 ms | 59 ms | 48 ms |
+| `subset_flow.rs` | 152 ms | 60 ms | 48 ms |
+| `heap.rs` | 187 ms | 113 ms | 103 ms |
+| `traits.rs` | 159 ms | 102 ms | 94 ms |
+| `big.rs` | 263 ms | 181 ms | 168 ms |
+
+| Project | `cargo build` | `athrad build` |
+|---|---|---|
+| `shapes`, edit in the binary crate | 162 ms | 172 ms |
+| `shapes`, edit in the library | 221 ms | 214 ms |
+| `big.rs` as a package | 276 ms | 239 ms |
+| `popular`, edit in the binary | 423 ms | 295 ms |
+
+The one-file numbers sit within about 10 ms of the tables from before this work. `big.rs` is the one that grew, by about 10 ms. `add.rs` and `subset_flow.rs` are still the subset frontend. On a small Cargo project the two tools finish together. `popular` is where Athrad pulls ahead: 295 ms against 423 ms.
+
+Where a warm one-file edit goes, inside the process (`ATHRAD_TIME=1`, the edited function already in the code cache):
+
+| Program | `rustc` | lower | codegen | link | total |
+|---|---|---|---|---|---|
+| `add.rs` | — | 0.1 ms, its own frontend | 0.3 ms | 35 ms | 36 ms |
+| `heap.rs` | 44 ms | 5 ms | 0.8 ms | 38 ms | 88 ms |
+| `big.rs` | 97 ms | 9 ms | 4 ms | 42 ms | 152 ms |
+
+The wall-clock table is that, plus starting the process (about 25 ms) or, for `athrad watch`, noticing the save (about 15 ms). The link is still the floor on a small file. On `heap.rs` and `big.rs`, `rustc`'s frontend is the larger piece.

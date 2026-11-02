@@ -19,10 +19,13 @@ Then the same for Cargo projects: `cargo build` against `athrad build`, an
 edit to the binary crate and one to its library dependency.
 
 usage: scripts/edit_loop.py [RUNS]   (needs a release build of athrad)
+
+Each run's samples are written to ATHRAD_EDIT_LOOP_JSON, or
+/tmp/athrad_edit_loop.json.
 """
 
+import json
 import os
-import re
 import shutil
 import statistics
 import subprocess
@@ -34,6 +37,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ATHRAD = ROOT / "target" / "release" / "athrad"
 RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+SAMPLES = Path(os.environ.get("ATHRAD_EDIT_LOOP_JSON", "/tmp/athrad_edit_loop.json"))
+RESULTS = {"runs": RUNS, "programs": [], "projects": []}
 
 # (program, literal to flip, what to flip it to). Each literal is in `main`.
 PROGRAMS = [
@@ -75,11 +80,16 @@ def output(exe):
     return r.returncode, r.stdout, r.stderr
 
 
+def save():
+    SAMPLES.write_text(json.dumps(RESULTS))
+
+
 def main():
     if not ATHRAD.exists():
         sys.exit("build athrad first: cargo build --release -p athrad")
-    print(f"{'program':15} {'cargo build':>12} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)")
+    print(f"{'program':15} {'cargo build':>12} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)", flush=True)
     for name, a, b in PROGRAMS:
+        print(f"measuring {name}", file=sys.stderr, flush=True)
         src = ROOT / "oracle" / "programs" / name
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
@@ -131,7 +141,9 @@ def main():
                 w.kill()
 
             med = lambda xs: statistics.median(xs)
-            print(f"{name:15} {med(cargo_ms):12.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}")
+            print(f"{name:15} {med(cargo_ms):12.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}", flush=True)
+            RESULTS["programs"].append({"name": name, "cargo": cargo_ms, "athrad": athrad_ms, "watch": watch_ms})
+            save()
 
 
 # Cargo projects: (name, files to copy in, file to edit, literal, flip).
@@ -140,14 +152,16 @@ PROJECTS = [
     ("shapes: bin edit", "oracle/crates/shapes", "app/src/util.rs", "== {} ==", "== {} ==!"),
     ("shapes: lib edit", "oracle/crates/shapes", "geom/src/lib.rs", "w * h,", "w * h + 0.0,"),
     ("big (crate)", None, "src/main.rs", "let (t, s) = work3(8);", "let (t, s) = work3(9);"),
+    ("popular: bin edit", "oracle/crates/popular", "src/main.rs", "with_seed(7)", "with_seed(8)"),
 ]
 
 
 def projects():
     athrad = ATHRAD.with_name("athrad")
-    print()
-    print(f"{'project':18} {'cargo build':>12} {'athrad build':>13}   (median of {RUNS}, ms)")
+    print(flush=True)
+    print(f"{'project':18} {'cargo build':>12} {'athrad build':>13}   (median of {RUNS}, ms)", flush=True)
     for label, src, file, a, b in PROJECTS:
+        print(f"measuring {label}", file=sys.stderr, flush=True)
         with tempfile.TemporaryDirectory() as tmp:
             proj = Path(tmp) / "p"
             if src:
@@ -165,7 +179,9 @@ def projects():
                 time.sleep(0.2)
                 athrad_ms.append(timed([athrad, "build", "-q"], proj))
             med = statistics.median
-            print(f"{label:18} {med(cargo_ms):12.0f} {med(athrad_ms):13.0f}")
+            print(f"{label:18} {med(cargo_ms):12.0f} {med(athrad_ms):13.0f}", flush=True)
+            RESULTS["projects"].append({"name": label, "cargo": cargo_ms, "athrad": athrad_ms})
+            save()
 
 
 if __name__ == "__main__":
