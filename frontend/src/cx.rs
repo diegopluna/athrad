@@ -170,9 +170,8 @@ pub(crate) fn arg_params<'tcx>(cx: Cx<'tcx>, arg: &ArgAbi<'tcx, Ty<'tcx>>) -> Re
 
 /// The IR signature for a Rust function's ABI.
 pub(crate) fn signature<'tcx>(cx: Cx<'tcx>, abi: &FnAbi<'tcx, Ty<'tcx>>) -> Result<ir::Signature> {
-    if abi.c_variadic {
-        return Err(unsupported("C-variadic functions"));
-    }
+    // A C-variadic function's own signature is its fixed parameters; each
+    // call adds its own (`FnCx::variadic_signature`).
     let mut sig = ir::Signature::default();
     match &abi.ret.mode {
         PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } => {

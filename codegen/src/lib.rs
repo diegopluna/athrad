@@ -54,6 +54,7 @@ pub fn compile_cached(
                 Id::Func(obj.declare_function(&imp.name, Linkage::Import, &signature(&obj, sig))?)
             }
             ir::ImportKind::Data => Id::Data(obj.declare_data(&imp.name, Linkage::Import, false, false)?),
+            ir::ImportKind::ThreadLocal => Id::Data(obj.declare_data(&imp.name, Linkage::Import, true, true)?),
         };
         ids.insert(&imp.name, id);
     }
@@ -62,7 +63,7 @@ pub fn compile_cached(
         ids.insert(&func.name, Id::Func(obj.declare_function(&func.name, linkage(func.linkage), &sig)?));
     }
     for d in &module.data {
-        ids.insert(&d.name, Id::Data(obj.declare_data(&d.name, linkage(d.linkage), d.writable, false)?));
+        ids.insert(&d.name, Id::Data(obj.declare_data(&d.name, linkage(d.linkage), d.writable, d.tls)?));
     }
 
     for d in &module.data {
@@ -99,9 +100,16 @@ pub fn compile_cached(
     }
 
     let imported: HashSet<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
+    let tls_names: HashSet<&str> = module
+        .imports
+        .iter()
+        .filter(|i| matches!(i.kind, ir::ImportKind::ThreadLocal))
+        .map(|i| i.name.as_str())
+        .chain(module.data.iter().filter(|d| d.tls).map(|d| d.name.as_str()))
+        .collect();
     let symbol_kind = |name: &str| match (ids.get(name), sigs.get(name)) {
         (Some(Id::Func(_)), Some(sig)) => cache::SymbolKind::Func { import: imported.contains(name), sig },
-        (Some(_), _) => cache::SymbolKind::Data { import: imported.contains(name) },
+        (Some(_), _) => cache::SymbolKind::Data { import: imported.contains(name), tls: tls_names.contains(name) },
         (None, _) => cache::SymbolKind::Missing,
     };
     let names: HashMap<u32, &str> = ids
@@ -238,6 +246,16 @@ fn host_isa() -> Result<OwnedTargetIsa> {
     // COFF, link.exe makes import thunks and base relocations itself.
     let pic = !cfg!(windows);
     flags.set("is_pic", if pic { "true" } else { "false" })?;
+    // How thread-locals are reached: through TLV descriptors on macOS, the
+    // general-dynamic model on ELF, the TLS index on Windows.
+    let tls = if cfg!(target_vendor = "apple") {
+        "macho"
+    } else if cfg!(windows) {
+        "coff"
+    } else {
+        "elf_gd"
+    };
+    flags.set("tls_model", tls)?;
     let isa_builder = cranelift_native::builder().map_err(|e| anyhow!("host ISA: {e}"))?;
     Ok(isa_builder.finish(settings::Flags::new(flags))?)
 }
@@ -454,11 +472,52 @@ fn lower(
                         vec![b.ins().symbol_value(types::I64, gv)]
                     }
                 },
+                ir::Op::TlsAddr(name) => {
+                    let Id::Data(id) = ids[name.as_str()] else { unreachable!("verified IR: `{name}` is data") };
+                    let gv = *globals
+                        .entry(ids.get_key_value(name.as_str()).unwrap().0)
+                        .or_insert_with(|| obj.declare_data_in_func(id, b.func));
+                    vec![b.ins().tls_value(types::I64, gv)]
+                }
                 ir::Op::Load(ty, addr, offset) => {
                     vec![b.ins().load(clif_type(*ty), MemFlagsData::new(), get(&values, *addr), *offset)]
                 }
                 ir::Op::Store(addr, offset, v) => {
                     b.ins().store(MemFlagsData::new(), get(&values, *v), get(&values, *addr), *offset);
+                    vec![]
+                }
+                ir::Op::AtomicLoad(ty, addr) => {
+                    vec![b.ins().atomic_load(clif_type(*ty), MemFlagsData::trusted(), get(&values, *addr))]
+                }
+                ir::Op::AtomicStore(addr, v) => {
+                    b.ins().atomic_store(MemFlagsData::trusted(), get(&values, *v), get(&values, *addr));
+                    vec![]
+                }
+                ir::Op::AtomicRmw(op, addr, v) => {
+                    use cranelift_codegen::ir::AtomicRmwOp as A;
+                    let op = match op {
+                        ir::RmwOp::Xchg => A::Xchg,
+                        ir::RmwOp::Add => A::Add,
+                        ir::RmwOp::Sub => A::Sub,
+                        ir::RmwOp::And => A::And,
+                        ir::RmwOp::Nand => A::Nand,
+                        ir::RmwOp::Or => A::Or,
+                        ir::RmwOp::Xor => A::Xor,
+                        ir::RmwOp::Smax => A::Smax,
+                        ir::RmwOp::Smin => A::Smin,
+                        ir::RmwOp::Umax => A::Umax,
+                        ir::RmwOp::Umin => A::Umin,
+                    };
+                    let v = get(&values, *v);
+                    let ty = b.func.dfg.value_type(v);
+                    vec![b.ins().atomic_rmw(ty, MemFlagsData::trusted(), op, get(&values, *addr), v)]
+                }
+                ir::Op::AtomicCas(addr, e, n) => {
+                    let (a, e, n) = (get(&values, *addr), get(&values, *e), get(&values, *n));
+                    vec![b.ins().atomic_cas(MemFlagsData::trusted(), a, e, n)]
+                }
+                ir::Op::Fence => {
+                    b.ins().fence();
                     vec![]
                 }
                 ir::Op::Call(name, args) => {

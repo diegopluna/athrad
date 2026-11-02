@@ -25,6 +25,8 @@ use crate::consts::{Addr, ModCx, off};
 use crate::cx::{Cx, cast_pieces, is_signed, pair_b_offset, scalar_type, signature};
 use crate::{Result, unsupported};
 
+mod simd;
+
 /// A place in memory, with the metadata of an unsized one.
 #[derive(Clone, Copy)]
 struct PlaceRef<'tcx> {
@@ -60,6 +62,9 @@ pub(crate) fn lower<'tcx>(m: &mut ModCx<'tcx>, instance: Instance<'tcx>, linkage
     let cx = m.cx();
     let mir = tcx.instance_mir(instance.def);
     let abi = cx.fn_abi_of_instance(instance, ty::List::empty());
+    if abi.c_variadic {
+        return Err(unsupported("defining C-variadic functions"));
+    }
     if abi.conv == rustc_abi::CanonAbi::RustCold {
         return Err(unsupported("defining `extern \"rust-cold\"` functions"));
     }
@@ -751,7 +756,11 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 };
                 self.write(dest, Val { v, layout: dest.layout })
             }
-            Rvalue::ThreadLocalRef(_) => Err(unsupported("thread-local statics")),
+            Rvalue::ThreadLocalRef(def_id) => {
+                let name = self.m.static_symbol(*def_id)?;
+                let addr = self.b.tls_addr(&name);
+                self.write(dest, Val { v: V::Scalar(addr), layout: dest.layout })
+            }
             Rvalue::Cast(kind, op, to) => {
                 let to = self.layout(self.monomorphize(*to));
                 let v = self.cast(*kind, op, to)?;
@@ -1656,6 +1665,72 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 put(self, d, false)?;
             }
             "catch_unwind" => return Err(unsupported("catching panics")),
+            _ if name.starts_with("simd_") => {
+                if !self.simd_intrinsic(name, inst, args, dest)? {
+                    return Err(unsupported(format!("the `{name}` intrinsic")));
+                }
+            }
+            // Atomics. Cranelift's are all sequentially consistent, as
+            // strong as any ordering the program asks for.
+            "atomic_fence" | "atomic_singlethreadfence" => self.b.fence(),
+            "atomic_load" => {
+                let layout = pointee(self, 0)?;
+                let ty = self.atomic_type(layout)?;
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                let v = self.b.atomic_load(ty, p);
+                put(self, v, false)?;
+            }
+            "atomic_store" => {
+                let layout = pointee(self, 0)?;
+                self.atomic_type(layout)?;
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                let v = self.operand(&args[1].node)?;
+                let v = self.load_scalar(v)?;
+                self.b.atomic_store(p, v);
+            }
+            "atomic_xchg" | "atomic_xadd" | "atomic_xsub" | "atomic_and" | "atomic_nand" | "atomic_or"
+            | "atomic_xor" | "atomic_max" | "atomic_min" | "atomic_umax" | "atomic_umin" => {
+                let layout = pointee(self, 0)?;
+                let ty = self.atomic_type(layout)?;
+                let op = match name {
+                    "atomic_xchg" => ir::RmwOp::Xchg,
+                    "atomic_xadd" => ir::RmwOp::Add,
+                    "atomic_xsub" => ir::RmwOp::Sub,
+                    "atomic_and" => ir::RmwOp::And,
+                    "atomic_nand" => ir::RmwOp::Nand,
+                    "atomic_or" => ir::RmwOp::Or,
+                    "atomic_xor" => ir::RmwOp::Xor,
+                    "atomic_max" => ir::RmwOp::Smax,
+                    "atomic_min" => ir::RmwOp::Smin,
+                    "atomic_umax" => ir::RmwOp::Umax,
+                    _ => ir::RmwOp::Umin,
+                };
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                // The operand may be another type of the same width (`usize`
+                // for an `AtomicPtr`'s byte offset).
+                let v = self.operand(&args[1].node)?;
+                let v = self.load_scalar(v)?;
+                let v = self.b.resize(ty, v, false);
+                let old = self.b.atomic_rmw(op, p, v);
+                put(self, old, false)?;
+            }
+            "atomic_cxchg" | "atomic_cxchgweak" => {
+                let layout = pointee(self, 0)?;
+                let ty = self.atomic_type(layout)?;
+                let p = self.operand(&args[0].node)?;
+                let p = self.load_scalar(p)?;
+                let e = self.operand(&args[1].node)?;
+                let e = self.load_scalar(e)?;
+                let n = self.operand(&args[2].node)?;
+                let n = self.load_scalar(n)?;
+                let (e, n) = (self.b.resize(ty, e, false), self.b.resize(ty, n, false));
+                let old = self.b.atomic_cas(p, e, n);
+                let ok = self.b.cmp(Cmp::Eq, old, e);
+                self.write(dest, Val { v: V::Pair(old, ok), layout: dest.layout })?;
+            }
             _ if float_intrinsic(name).is_some() => {
                 let (op, ft) = float_intrinsic(name).expect("a float intrinsic");
                 let ft = ft.or_else(|| float_ty(inst.args.type_at(0)));
@@ -1695,9 +1770,25 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 };
                 put(self, r, false)?;
             }
-            // Intrinsics that are constants once their types are known:
-            // `type_name`, `type_id`, `needs_drop`, `variant_count`, ...
-            _ if args.is_empty() && def.must_be_overridden => {
+            // Whether the crate is built with debug assertions in std
+            // (`ub_checks`), overflow checks, and contract checks: the
+            // session says, as it does for rustc's backends.
+            "ub_checks" | "overflow_checks" | "contract_checks" => {
+                let on = match name {
+                    "ub_checks" => tcx.sess.ub_checks(),
+                    "overflow_checks" => tcx.sess.overflow_checks(),
+                    _ => tcx.sess.contract_checks(),
+                };
+                let v = self.b.iconst(Type::I8, i128::from(on));
+                put(self, v, false)?;
+            }
+            // Intrinsics that are constants once their types are known.
+            _ if args.is_empty()
+                && matches!(
+                    name,
+                    "type_name" | "type_id" | "needs_drop" | "variant_count" | "size_of" | "align_of" | "pref_align_of"
+                ) =>
+            {
                 let env = ty::TypingEnv::fully_monomorphized();
                 let value = tcx
                     .const_eval_instance(env, inst, si.span)
@@ -1718,6 +1809,70 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         Ok(true)
     }
 
+    /// The signature of one call to a C-variadic function: the fixed
+    /// parameters as usual, then each variadic argument as a 64-bit integer
+    /// (C promotes narrower ones; Athrad passes no floats). On Apple's
+    /// aarch64 variadic arguments go on the stack, so the integer registers
+    /// before them are filled with zeros, as `rustc_codegen_cranelift` does.
+    fn variadic_signature(
+        &mut self,
+        abi: &FnAbi<'tcx, Ty<'tcx>>,
+        call_args: &mut Vec<Value>,
+        fixed_end: usize,
+    ) -> Result<ir::Signature> {
+        if abi.conv != rustc_abi::CanonAbi::C {
+            return Err(unsupported("variadic calls outside the C ABI"));
+        }
+        let mut sig = ir::Signature::default();
+        match &abi.ret.mode {
+            PassMode::Indirect { .. } => sig.params.push(ir::Param { sret: true, ..ir::Param::new(PTR) }),
+            _ => sig.returns = crate::cx::arg_params(self.cx, &abi.ret)?,
+        }
+        for arg in &abi.args[..abi.fixed_count as usize] {
+            sig.params.extend(crate::cx::arg_params(self.cx, arg)?);
+        }
+        if sig.params.iter().any(|p| p.float) {
+            return Err(unsupported("variadic calls with float parameters"));
+        }
+        let mut extra = Vec::new();
+        for (arg, &v) in abi.args[abi.fixed_count as usize..].iter().zip(&call_args[fixed_end..]) {
+            if !matches!(arg.mode, PassMode::Direct(_))
+                || !matches!(arg.layout.ty.kind(), ty::Int(_) | ty::Uint(_) | ty::RawPtr(..) | ty::Ref(..))
+            {
+                return Err(unsupported(format!("passing `{}` to a variadic function", arg.layout.ty)));
+            }
+            let signed = matches!(arg.layout.ty.kind(), ty::Int(_));
+            if self.b.value_type(v) == Type::I128 {
+                return Err(unsupported("passing a 128-bit integer to a variadic function"));
+            }
+            extra.push(self.b.resize(Type::I64, v, signed));
+        }
+        call_args.truncate(fixed_end);
+        let target = &self.tcx.sess.target;
+        if !extra.is_empty() && target.is_like_darwin && target.arch == rustc_target::spec::Arch::AArch64 {
+            let sret = usize::from(sig.params.first().is_some_and(|p| p.sret));
+            let used: usize = sig.params[sret..].iter().map(|p| if p.ty == Type::I128 { 2 } else { 1 }).sum();
+            for _ in used..8 {
+                sig.params.push(ir::Param::new(Type::I64));
+                call_args.push(self.b.iconst(Type::I64, 0));
+            }
+        }
+        for v in extra {
+            sig.params.push(ir::Param::new(Type::I64));
+            call_args.push(v);
+        }
+        Ok(sig)
+    }
+
+    /// The IR type of an atomic's value: an integer or pointer up to 64
+    /// bits.
+    fn atomic_type(&self, layout: TyAndLayout<'tcx>) -> Result<Type> {
+        match layout.ty.kind() {
+            ty::Int(_) | ty::Uint(_) | ty::RawPtr(..) | ty::Bool if layout.size.bytes() <= 8 => self.scalar_of(layout),
+            _ => Err(unsupported(format!("atomics on `{}`", layout.ty))),
+        }
+    }
+
     fn emit_call(
         &mut self,
         callee: Callee,
@@ -1726,8 +1881,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         dest: Option<PlaceRef<'tcx>>,
     ) -> Result<()> {
         assert_eq!(abi.args.len(), vals.len(), "one value per ABI argument");
-        let sig = signature(self.cx, abi)?;
+        let variadic = abi.c_variadic;
+        let mut sig = if variadic { ir::Signature::default() } else { signature(self.cx, abi)? };
         let mut call_args = Vec::new();
+        let mut fixed_end = None;
 
         let ret_mem = match &abi.ret.mode {
             PassMode::Indirect { .. } => {
@@ -1743,6 +1900,9 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
         let mut fn_ptr = None;
         for (i, (val, arg)) in vals.into_iter().zip(abi.args.iter()).enumerate() {
+            if variadic && i == abi.fixed_count as usize {
+                fixed_end = Some(call_args.len());
+            }
             if i == 0
                 && let Callee::Virtual(idx) = callee
             {
@@ -1773,6 +1933,21 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     self.write_raw(tmp, val)?;
                     call_args.push(tmp);
                 }
+            }
+        }
+
+        let mut callee = callee;
+        if variadic {
+            let fixed_end = fixed_end.unwrap_or(call_args.len());
+            sig = self.variadic_signature(abi, &mut call_args, fixed_end)?;
+            // Each call site's signature is its own; call through the
+            // symbol's address, declared with the fixed parameters alone.
+            if let Callee::Direct(name) = &callee {
+                let mut fixed = sig.clone();
+                fixed.params.truncate(fixed_end);
+                self.m.use_func(name, fixed);
+                let addr = self.b.symbol_addr(name);
+                callee = Callee::Indirect(addr);
             }
         }
 

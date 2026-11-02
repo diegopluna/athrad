@@ -69,6 +69,7 @@ impl Mod<'_> {
             name: name.clone(),
             linkage: Linkage::Local,
             writable: false,
+            tls: false,
             align,
             bytes,
             relocs,

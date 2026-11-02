@@ -192,6 +192,7 @@ pub(crate) enum SymbolKind<'a> {
     },
     Data {
         import: bool,
+        tls: bool,
     },
     /// Not in the module: verification rejects the function.
     Missing,
@@ -215,7 +216,7 @@ pub(crate) fn key<'a>(isa: &dyn TargetIsa, func: &'a ir::Function, symbol: impl 
         .iter()
         .flat_map(|b| &b.insts)
         .filter_map(|i| match &i.op {
-            ir::Op::Call(name, _) | ir::Op::SymbolAddr(name) => Some(name.as_str()),
+            ir::Op::Call(name, _) | ir::Op::SymbolAddr(name) | ir::Op::TlsAddr(name) => Some(name.as_str()),
             _ => None,
         })
         .collect();

@@ -28,6 +28,8 @@ pub(crate) struct ModCx<'tcx> {
     /// The concrete type and principal trait of every vtable the program
     /// builds.
     pub(crate) vtables: Vec<(Ty<'tcx>, Option<DefId>)>,
+    /// Thread-local statics referred to.
+    thread_locals: std::collections::BTreeSet<String>,
 }
 
 /// What an address constant points at.
@@ -48,6 +50,7 @@ impl<'tcx> ModCx<'tcx> {
             writable_allocs: 0,
             skippable: Default::default(),
             vtables: Vec::new(),
+            thread_locals: Default::default(),
         }
     }
 
@@ -75,14 +78,13 @@ impl<'tcx> ModCx<'tcx> {
     /// The symbol of a static, defined by this crate or another.
     pub(crate) fn static_symbol(&mut self, def_id: DefId) -> Result<String> {
         let attrs = self.tcx.codegen_fn_attrs(def_id);
-        if attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
-            return Err(unsupported("thread-local statics"));
-        }
         if attrs.import_linkage.is_some() {
             return Err(unsupported("statics with `#[linkage]`"));
         }
         let name = self.tcx.symbol_name(Instance::mono(self.tcx, def_id)).name.to_owned();
-        if !self.datas.contains(&name) {
+        if attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
+            self.thread_locals.insert(name.clone());
+        } else if !self.datas.contains(&name) {
             self.datas.push(name.clone());
         }
         Ok(name)
@@ -154,7 +156,8 @@ impl<'tcx> ModCx<'tcx> {
         let name = self.static_symbol(def_id)?;
         let alloc =
             self.tcx.eval_static_initializer(def_id).map_err(|_| unsupported("a static whose initializer failed"))?;
-        let data = self.data_for(alloc.inner(), name, linkage)?;
+        let mut data = self.data_for(alloc.inner(), name, linkage)?;
+        data.tls = self.tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL);
         self.module.push_data(data);
         Ok(())
     }
@@ -187,6 +190,7 @@ impl<'tcx> ModCx<'tcx> {
             name,
             linkage,
             writable: alloc.mutability.is_mut(),
+            tls: false,
             align: alloc.align.bytes(),
             bytes: out,
             relocs,
@@ -200,6 +204,11 @@ impl<'tcx> ModCx<'tcx> {
         for (name, sig) in funcs {
             if self.module.function(&name).is_none() {
                 self.module.import_func(&name, sig);
+            }
+        }
+        for name in std::mem::take(&mut self.thread_locals) {
+            if !self.module.data.iter().any(|d| d.name == name) {
+                self.module.import_thread_local(&name);
             }
         }
         for name in std::mem::take(&mut self.datas) {

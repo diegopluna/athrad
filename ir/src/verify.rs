@@ -64,11 +64,12 @@ impl<'a> Verifier<'a> {
             let sym = match &i.kind {
                 crate::ImportKind::Func(sig) => Symbol::Func(sig),
                 crate::ImportKind::Data => Symbol::Data,
+                crate::ImportKind::ThreadLocal => Symbol::ThreadLocal,
             };
             symbols.insert(&i.name, sym);
         }
         for d in &module.data {
-            symbols.insert(&d.name, Symbol::Data);
+            symbols.insert(&d.name, if d.tls { Symbol::ThreadLocal } else { Symbol::Data });
         }
         for f in &module.functions {
             symbols.insert(&f.name, Symbol::Func(&f.sig));
@@ -270,7 +271,19 @@ impl Checker<'_> {
                 vec![PTR]
             }
             Op::SymbolAddr(name) => {
-                self.symbols.get(name.as_str()).ok_or_else(|| format!("address of unknown symbol `{name}`"))?;
+                match self.symbols.get(name.as_str()) {
+                    None => return Err(format!("address of unknown symbol `{name}`")),
+                    Some(Symbol::ThreadLocal) => {
+                        return Err(format!("`{name}` is thread-local; take its address with tls_addr"));
+                    }
+                    Some(_) => {}
+                }
+                vec![PTR]
+            }
+            Op::TlsAddr(name) => {
+                if !matches!(self.symbols.get(name.as_str()), Some(Symbol::ThreadLocal)) {
+                    return Err(format!("tls_addr of `{name}`, which is not thread-local"));
+                }
                 vec![PTR]
             }
             Op::Load(ty, addr, _) => {
@@ -282,10 +295,34 @@ impl Checker<'_> {
                 use_(*v)?;
                 vec![]
             }
+            Op::AtomicLoad(ty, addr) => {
+                ptr(*addr)?;
+                if *ty == Type::I128 {
+                    return Err("a 128-bit atomic".into());
+                }
+                vec![*ty]
+            }
+            Op::AtomicStore(addr, v) | Op::AtomicRmw(_, addr, v) => {
+                ptr(*addr)?;
+                let t = use_(*v)?;
+                if t == Type::I128 {
+                    return Err("a 128-bit atomic".into());
+                }
+                if matches!(inst.op, Op::AtomicStore(..)) { vec![] } else { vec![t] }
+            }
+            Op::AtomicCas(addr, e, n) => {
+                ptr(*addr)?;
+                let t = same(*e, *n, &"atomic_cas")?;
+                if t == Type::I128 {
+                    return Err("a 128-bit atomic".into());
+                }
+                vec![t]
+            }
+            Op::Fence => vec![],
             Op::Call(name, args) => {
                 let sig = match self.symbols.get(name.as_str()).copied() {
                     Some(Symbol::Func(sig)) => sig,
-                    Some(Symbol::Data) => return Err(format!("call to data symbol `{name}`")),
+                    Some(Symbol::Data | Symbol::ThreadLocal) => return Err(format!("call to data symbol `{name}`")),
                     None => return Err(format!("call to unknown function `{name}`")),
                 };
                 args_match(name, args, sig.param_types())?;
@@ -505,6 +542,7 @@ mod tests {
             name: "d".into(),
             linkage: Linkage::Local,
             writable: false,
+            tls: false,
             align: 8,
             bytes: vec![0; 8],
             relocs: vec![Reloc { offset: 0, symbol: "nowhere".into(), addend: 0 }],

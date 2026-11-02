@@ -136,6 +136,8 @@ pub struct Import {
 pub enum ImportKind {
     Func(Signature),
     Data,
+    /// A `#[thread_local]` static: each thread has its own.
+    ThreadLocal,
 }
 
 /// Bytes in the executable, with the addresses of other symbols written into
@@ -145,6 +147,8 @@ pub struct Data {
     pub name: String,
     pub linkage: Linkage,
     pub writable: bool,
+    /// A `#[thread_local]` static: these bytes are each thread's first value.
+    pub tls: bool,
     pub align: u64,
     pub bytes: Vec<u8>,
     pub relocs: Vec<Reloc>,
@@ -273,6 +277,22 @@ pub enum FCmp {
     Uno,
 }
 
+/// Read-modify-write operations for [`Op::AtomicRmw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RmwOp {
+    Xchg,
+    Add,
+    Sub,
+    And,
+    Nand,
+    Or,
+    Xor,
+    Smax,
+    Smin,
+    Umax,
+    Umin,
+}
+
 /// Arithmetic that also reports whether the exact result fit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OverflowOp {
@@ -342,10 +362,21 @@ pub enum Op {
     SlotAddr(Slot),
     /// The address of a function or data symbol.
     SymbolAddr(String),
+    /// The address of this thread's copy of a thread-local.
+    TlsAddr(String),
     /// Load a value of this type from `addr + offset`. Need not be aligned.
     Load(Type, Value, i32),
     /// Store the second value at `addr + offset`. Need not be aligned.
     Store(Value, i32, Value),
+    /// Atomic operations, all sequentially consistent (as strong as any
+    /// ordering Rust asks for). Up to 64 bits.
+    AtomicLoad(Type, Value),
+    AtomicStore(Value, Value),
+    /// The old value.
+    AtomicRmw(RmwOp, Value, Value),
+    /// `(addr, expected, new)`: the old value.
+    AtomicCas(Value, Value, Value),
+    Fence,
     /// Call a function of this module or an import, by name.
     Call(String, Vec<Value>),
     /// Call the function at an address.
@@ -422,6 +453,7 @@ pub struct Module {
 pub enum Symbol<'a> {
     Func(&'a Signature),
     Data,
+    ThreadLocal,
 }
 
 impl Module {
@@ -437,6 +469,12 @@ impl Module {
     }
 
     /// Import a data symbol. Importing the same one twice is a no-op.
+    pub fn import_thread_local(&mut self, name: &str) {
+        if !self.imports.iter().any(|e| e.name == name) {
+            self.imports.push(Import { name: name.to_owned(), kind: ImportKind::ThreadLocal });
+        }
+    }
+
     pub fn import_data(&mut self, name: &str) {
         if !self.imports.iter().any(|e| e.name == name) {
             self.imports.push(Import { name: name.to_owned(), kind: ImportKind::Data });
@@ -460,12 +498,13 @@ impl Module {
         if let Some(f) = self.function(name) {
             return Some(Symbol::Func(&f.sig));
         }
-        if self.data.iter().any(|d| d.name == name) {
-            return Some(Symbol::Data);
+        if let Some(d) = self.data.iter().find(|d| d.name == name) {
+            return Some(if d.tls { Symbol::ThreadLocal } else { Symbol::Data });
         }
         self.imports.iter().find(|i| i.name == name).map(|i| match &i.kind {
             ImportKind::Func(sig) => Symbol::Func(sig),
             ImportKind::Data => Symbol::Data,
+            ImportKind::ThreadLocal => Symbol::ThreadLocal,
         })
     }
 
@@ -473,7 +512,7 @@ impl Module {
     pub fn signature(&self, name: &str) -> Option<&Signature> {
         match self.symbol(name)? {
             Symbol::Func(sig) => Some(sig),
-            Symbol::Data => None,
+            Symbol::Data | Symbol::ThreadLocal => None,
         }
     }
 }
@@ -578,6 +617,28 @@ impl FunctionBuilder {
         self.def(to.bits_type(), Op::FConvert { from, to, v })
     }
 
+    pub fn atomic_load(&mut self, ty: Type, addr: Value) -> Value {
+        self.def(ty, Op::AtomicLoad(ty, addr))
+    }
+
+    pub fn atomic_store(&mut self, addr: Value, v: Value) {
+        self.push(Inst { results: Vec::new(), op: Op::AtomicStore(addr, v) });
+    }
+
+    pub fn atomic_rmw(&mut self, op: RmwOp, addr: Value, v: Value) -> Value {
+        let ty = self.value_type(v);
+        self.def(ty, Op::AtomicRmw(op, addr, v))
+    }
+
+    pub fn atomic_cas(&mut self, addr: Value, expected: Value, new: Value) -> Value {
+        let ty = self.value_type(new);
+        self.def(ty, Op::AtomicCas(addr, expected, new))
+    }
+
+    pub fn fence(&mut self) {
+        self.push(Inst { results: Vec::new(), op: Op::Fence });
+    }
+
     pub fn add(&mut self, a: Value, b: Value) -> Value {
         self.binary(BinOp::Add, a, b)
     }
@@ -633,6 +694,10 @@ impl FunctionBuilder {
 
     pub fn symbol_addr(&mut self, name: &str) -> Value {
         self.def(PTR, Op::SymbolAddr(name.to_owned()))
+    }
+
+    pub fn tls_addr(&mut self, name: &str) -> Value {
+        self.def(PTR, Op::TlsAddr(name.to_owned()))
     }
 
     pub fn load(&mut self, ty: Type, addr: Value, offset: i32) -> Value {
@@ -788,6 +853,7 @@ impl fmt::Display for Module {
             match &i.kind {
                 ImportKind::Func(sig) => writeln!(f, "import fn {}{sig}", i.name)?,
                 ImportKind::Data => writeln!(f, "import data {}", i.name)?,
+                ImportKind::ThreadLocal => writeln!(f, "import thread_local {}", i.name)?,
             }
         }
         for d in &self.data {
@@ -846,8 +912,14 @@ impl fmt::Display for Function {
                     Op::Trunc(ty, v) => writeln!(f, "trunc.{ty} {v}")?,
                     Op::SlotAddr(s) => writeln!(f, "slot_addr {s}")?,
                     Op::SymbolAddr(name) => writeln!(f, "symbol_addr {name}")?,
+                    Op::TlsAddr(name) => writeln!(f, "tls_addr {name}")?,
                     Op::Load(ty, a, o) => writeln!(f, "load.{ty} {a}+{o}")?,
                     Op::Store(a, o, v) => writeln!(f, "store {a}+{o}, {v}")?,
+                    Op::AtomicLoad(ty, a) => writeln!(f, "atomic_load.{ty} {a}")?,
+                    Op::AtomicStore(a, v) => writeln!(f, "atomic_store {a}, {v}")?,
+                    Op::AtomicRmw(op, a, v) => writeln!(f, "atomic_{} {a}, {v}", lower(op))?,
+                    Op::AtomicCas(a, e, n) => writeln!(f, "atomic_cas {a}, {e}, {n}")?,
+                    Op::Fence => writeln!(f, "fence")?,
                     Op::Call(name, args) => writeln!(f, "call {name}({})", list(args))?,
                     Op::CallIndirect(sig, callee, args) => writeln!(f, "call_indirect {sig} {callee}({})", list(args))?,
                 }
