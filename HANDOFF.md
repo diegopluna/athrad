@@ -289,3 +289,19 @@ Where one build goes, inside the process (`ATHRAD_TIME=1`, the middle of 3 runs,
 | `big.rs` | 134 ms | 37 ms | 69 ms (7,373) | 43 ms | 283 ms |
 
 The wall clock is that, plus starting the process, or for `athrad watch` noticing the save. On `big.rs` the 134 ms is `rustc`: the crate's analysis, and the monomorphization queries. After those queries the walk itself is a few milliseconds. Cranelift is 69 ms. The link is still the floor on a small file, about 36 ms.
+
+### Release builds: as fast to run, faster to build
+
+The goal changed: a release binary that runs as fast as `cargo build --release`'s, built in less time. Athrad's own code generator cannot meet the first half. On a CPU benchmark (sieve, collatz, `HashMap`, sort), LLVM's binary ran in 0.45 s; Athrad's best Cranelift settings (`opt_level=speed`, the backtracking register allocator, release MIR) ran in 2.97 s, and today's default in 9.9 s, 3x slower than `rustc`'s debug build. Every local lives in a stack slot and small functions are not inlined. So a release mode keeps LLVM generating the code, and only the build around it can get faster.
+
+`bench/release` holds ten run-time workloads (regex, serde_json, `HashMap`, sorting, miniz_oxide, sha2, integer loops, n-body, `BTreeMap`, strings), each printing a checksum. `scripts/release_bench.py` builds them under `cargo build --release` and under candidate settings, times clean builds and a one-file edit, runs every binary interleaved across settings, and fails on any output that differs. First runs, on boat.dev sandboxes (AMD Ryzen 7 9700X, 4 vCPU), 3 builds and 9 runs per setting, ratios against cargo in the same sandbox:
+
+| Setting | Clean build | Edit | Run geomean / worst |
+|---|---|---|---|
+| `-C lto=off` | 0.83x | 0.53x | 1.02x / 1.19x (btree) |
+| `-Zthreads=4` | 0.90x | noise | 0.97x / 1.08x |
+| `opt-level=2` | 1.19x | 1.07x | 1.00x / 1.12x (sort) |
+| `-Zshare-generics=yes` | 1.03x | 0.65x | 1.02x / 1.08x (strings) |
+| `codegen-units=256` | 1.00x | 0.89x | 0.99x / 1.04x |
+
+The same cargo build took 5.8 s on one sandbox and 10.2 s on the other, so compare only within a run, and treat effects under about 10% as unresolved at 3 rounds. No `rustc` setting gives a large cut without slowing some binary: LLVM's optimizer is most of a release build, and it is the part that makes the code fast.

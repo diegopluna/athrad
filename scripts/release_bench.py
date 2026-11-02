@@ -33,6 +33,9 @@ VARIANTS = {
     "lto-off": {"CARGO_PROFILE_RELEASE_LTO": "off"},
     "threads": {"RUSTFLAGS": f"-Zthreads={os.cpu_count()}"},
     "lto-off+threads": {"CARGO_PROFILE_RELEASE_LTO": "off", "RUSTFLAGS": f"-Zthreads={os.cpu_count()}"},
+    "opt2": {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "2"},
+    "share-generics": {"RUSTFLAGS": "-Zshare-generics=yes"},
+    "cgu256": {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "256"},
 }
 
 
