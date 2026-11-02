@@ -41,7 +41,7 @@ use rustc_ast::expand::allocator::{AllocatorTy, NO_ALLOC_SHIM_IS_UNSTABLE, defau
 use rustc_codegen_ssa::assert_module_sources::CguReuse;
 use rustc_codegen_ssa::base::{allocator_kind_for_codegen, allocator_shim_contents, determine_cgu_reuse};
 use rustc_codegen_ssa::traits::CodegenBackend;
-use rustc_codegen_ssa::{CompiledModules, CrateInfo, TargetConfig};
+use rustc_codegen_ssa::{CompiledModule, CompiledModules, CrateInfo, ModuleKind, TargetConfig};
 use rustc_driver::Compilation;
 use rustc_hir::LangItem;
 use rustc_hir::attrs::{Linkage as RLinkage, NativeLibKind};
@@ -75,12 +75,16 @@ pub type Codegen = Arc<dyn Fn(&ir::Module, &str) -> Result<PathBuf> + Send + Syn
 
 /// A crate, compiled to objects.
 pub struct Output {
-    /// One object per codegen unit, and one for the allocator shim, all in
-    /// the work directory.
-    pub objects: Vec<PathBuf>,
-    /// What to link the objects with: `std`'s rlibs and the system
-    /// libraries they need.
-    pub link: link::Inputs,
+    /// One object per codegen unit, by unit name, in the work directory.
+    pub objects: Vec<(String, PathBuf)>,
+    /// The allocator shim's object, for crates that link one.
+    pub allocator: Option<PathBuf>,
+    /// For an executable: what to link the objects with, `std`'s rlibs and
+    /// the system libraries they need.
+    pub link: Option<link::Inputs>,
+    /// This crate's trait-object drops and vtables, for the executable that
+    /// links it.
+    facts: unwind::Facts,
     /// How long Athrad's own lowering took, out of the whole compile.
     pub lower_time: std::time::Duration,
     /// Codegen units `rustc` found unchanged since the last build, whose
@@ -96,9 +100,9 @@ pub struct Output {
 /// `rustc_codegen_cranelift` is: `rustc` runs its whole pipeline, including
 /// incremental compilation when `args` ask for it, and hands the backend the
 /// crate to generate code for. The backend lowers it to IR and gives it back
-/// here; `rustc` writes nothing. Everything else (the target's `cfg`s, its
-/// features, its CPU) comes from `rustc`'s own LLVM backend, so a program
-/// sees the same configuration it would under `rustc`.
+/// here, for the caller to link; `rustc` writes nothing. Everything else
+/// (the target's `cfg`s, its features, its CPU) comes from `rustc`'s own
+/// LLVM backend, so a program sees the configuration it would under `rustc`.
 ///
 /// Each codegen unit becomes an object through `codegen`, in `work_dir`.
 /// With `-C incremental` in `args`, a unit `rustc` finds unchanged since the
@@ -106,98 +110,9 @@ pub struct Output {
 /// product, as LLVM's is under `rustc`, and `rustc` decides when it is still
 /// good.
 pub fn compile(args: &[String], work_dir: &Path, codegen: Codegen) -> Result<Output> {
-    type Slot = Arc<Mutex<Option<Result<Output>>>>;
-
-    struct Callbacks {
-        slot: Slot,
-        work_dir: PathBuf,
-        codegen: Codegen,
-    }
-    impl rustc_driver::Callbacks for Callbacks {
-        fn config(&mut self, config: &mut Config) {
-            // Without incremental compilation nothing is reused, and one
-            // unit means each instance is lowered once. With it, 16 units:
-            // `rustc`'s incremental default is a unit per module (and per
-            // upstream module with generic instances, 67 for `heap.rs`),
-            // and each unit costs about a millisecond to check and to link,
-            // which outweighs what finer reuse saves for one-file programs.
-            // 16 is what `rustc` uses without incremental compilation.
-            if config.opts.cli_forced_codegen_units.is_none() {
-                config.opts.cli_forced_codegen_units = Some(if config.opts.incremental.is_none() { 1 } else { 16 });
-            }
-            // `RUSTC_BOOTSTRAP` is set for Athrad's own build. The program
-            // must be held to stable Rust, as `rustc` holds it.
-            // (`ATHRAD_RUSTC_ARGS`, for looking inside, may pass `-Z` flags.)
-            if std::env::var_os("ATHRAD_RUSTC_ARGS").is_none() {
-                config.opts.unstable_features = rustc_feature::UnstableFeatures::Disallow;
-            }
-            let slot = self.slot.clone();
-            let work_dir = self.work_dir.clone();
-            let codegen = self.codegen.clone();
-            config.make_codegen_backend = Some(Box::new(move |sess| {
-                let early = rustc_session::EarlyDiagCtxt::new(sess.opts.error_format);
-                let llvm = rustc_interface::util::get_codegen_backend(&early, &sess.opts.sysroot, None, &sess.target);
-                Box::new(Backend { llvm, slot, work_dir, codegen })
-            }));
-        }
-    }
-
-    struct Backend {
-        llvm: Box<dyn CodegenBackend>,
-        slot: Slot,
-        work_dir: PathBuf,
-        codegen: Codegen,
-    }
-
-    /// What `codegen_crate` hands `join_codegen`.
-    struct Ongoing {
-        result: Result<Output>,
-        work_products: WorkProductMap,
-    }
-    impl CodegenBackend for Backend {
-        fn name(&self) -> &'static str {
-            "athrad"
-        }
-        fn init(&self, sess: &Session) {
-            self.llvm.init(sess)
-        }
-        fn print(&self, req: &PrintRequest, out: &mut String, sess: &Session) {
-            self.llvm.print(req, out, sess)
-        }
-        fn target_config(&self, sess: &Session) -> TargetConfig {
-            self.llvm.target_config(sess)
-        }
-        fn provide(&self, providers: &mut Providers) {
-            self.llvm.provide(providers)
-        }
-        fn target_cpu(&self, sess: &Session) -> String {
-            self.llvm.target_cpu(sess)
-        }
-        fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
-            let mut work_products = WorkProductMap::default();
-            let result = lower_crate(tcx, &self.work_dir, &self.codegen, &mut work_products);
-            Box::new(Ongoing { result, work_products })
-        }
-        fn join_codegen(
-            &self,
-            ongoing: Box<dyn Any>,
-            _: &Session,
-            _: &OutputFilenames,
-            _: &CrateInfo,
-        ) -> (CompiledModules, WorkProductMap) {
-            let ongoing = ongoing.downcast::<Ongoing>().expect("what codegen_crate returned");
-            let Ongoing { result, work_products } = *ongoing;
-            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
-            (CompiledModules { modules: Vec::new(), allocator_module: None }, work_products)
-        }
-        fn link(&self, _: &Session, _: CompiledModules, _: CrateInfo, _: EncodedMetadata, _: &OutputFilenames) {
-            // Athrad links, with its own object, after rustc is done.
-        }
-    }
-
-    let slot = Slot::default();
     std::fs::create_dir_all(work_dir).with_context(|| format!("creating {}", work_dir.display()))?;
-    let mut cb = Callbacks { slot: slot.clone(), work_dir: work_dir.to_owned(), codegen };
+    let slot = Slot::default();
+    let mut cb = Callbacks { slot: slot.clone(), work_dir: work_dir.to_owned(), codegen, rustc_links: false };
     let ran = rustc_driver::catch_fatal_errors(|| rustc_driver::run_compiler(args, &mut cb));
     let result = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     match (ran, result) {
@@ -206,17 +121,215 @@ pub fn compile(args: &[String], work_dir: &Path, codegen: Codegen) -> Result<Out
     }
 }
 
+/// Be `rustc`: run the command line `args` (program name first) as `rustc`
+/// would, with Athrad generating the code, and return `rustc`'s exit code.
+/// This is how Cargo drives Athrad, through `RUSTC_WRAPPER`. `rustc` links
+/// what Athrad generates itself: archives for libraries, with their
+/// metadata, and executables, with the link arguments Cargo and the crates
+/// give. A crate Athrad cannot compile the way `rustc` would is an error.
+pub fn run_as_rustc(args: &[String], work_dir: &Path, codegen: Codegen) -> std::process::ExitCode {
+    if let Err(e) = std::fs::create_dir_all(work_dir) {
+        eprintln!("error: creating {}: {e}", work_dir.display());
+        return std::process::ExitCode::FAILURE;
+    }
+    let mut cb = Callbacks { slot: Slot::default(), work_dir: work_dir.to_owned(), codegen, rustc_links: true };
+    rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(args, &mut cb))
+}
+
+type Slot = Arc<Mutex<Option<Result<Output>>>>;
+
+struct Callbacks {
+    slot: Slot,
+    work_dir: PathBuf,
+    codegen: Codegen,
+    rustc_links: bool,
+}
+
+impl rustc_driver::Callbacks for Callbacks {
+    fn config(&mut self, config: &mut Config) {
+        // Without incremental compilation nothing is reused, and one unit
+        // means each instance is lowered once. With it, 16 units: `rustc`'s
+        // incremental default is a unit per module (and per upstream module
+        // with generic instances, 67 for `heap.rs`), and each unit costs
+        // about a millisecond to check and to link, which outweighs what
+        // finer reuse saves for small crates. 16 is what `rustc` uses
+        // without incremental compilation.
+        if config.opts.cli_forced_codegen_units.is_none() {
+            config.opts.cli_forced_codegen_units = Some(if config.opts.incremental.is_none() { 1 } else { 16 });
+        }
+        // `RUSTC_BOOTSTRAP` is set for Athrad's own build. The program must
+        // be held to stable Rust, as `rustc` holds it. (`ATHRAD_RUSTC_ARGS`,
+        // for looking inside, may pass `-Z` flags.)
+        if std::env::var_os("ATHRAD_RUSTC_ARGS").is_none() {
+            config.opts.unstable_features = rustc_feature::UnstableFeatures::Disallow;
+        }
+        let slot = self.slot.clone();
+        let work_dir = self.work_dir.clone();
+        let codegen = self.codegen.clone();
+        let rustc_links = self.rustc_links;
+        config.make_codegen_backend = Some(Box::new(move |sess| {
+            let early = rustc_session::EarlyDiagCtxt::new(sess.opts.error_format);
+            let llvm = rustc_interface::util::get_codegen_backend(&early, &sess.opts.sysroot, None, &sess.target);
+            Box::new(Backend { llvm, slot, work_dir, codegen, rustc_links })
+        }));
+    }
+}
+
+struct Backend {
+    llvm: Box<dyn CodegenBackend>,
+    slot: Slot,
+    work_dir: PathBuf,
+    codegen: Codegen,
+    /// `rustc` links the result (Athrad is driven by Cargo), rather than the
+    /// caller of [`compile`].
+    rustc_links: bool,
+}
+
+/// What `codegen_crate` hands `join_codegen`.
+struct Ongoing {
+    result: Result<Output>,
+    work_products: WorkProductMap,
+}
+
+impl CodegenBackend for Backend {
+    fn name(&self) -> &'static str {
+        "athrad"
+    }
+    fn init(&self, sess: &Session) {
+        self.llvm.init(sess)
+    }
+    fn print(&self, req: &PrintRequest, out: &mut String, sess: &Session) {
+        self.llvm.print(req, out, sess)
+    }
+    fn print_version(&self) {
+        self.llvm.print_version()
+    }
+    fn target_config(&self, sess: &Session) -> TargetConfig {
+        self.llvm.target_config(sess)
+    }
+    fn provide(&self, providers: &mut Providers) {
+        self.llvm.provide(providers)
+    }
+    fn target_cpu(&self, sess: &Session) -> String {
+        self.llvm.target_cpu(sess)
+    }
+    fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
+        let mut work_products = WorkProductMap::default();
+        let result = lower_crate(tcx, &self.work_dir, &self.codegen, &mut work_products, self.rustc_links);
+        if self.rustc_links
+            && let Err(e) = &result
+        {
+            tcx.dcx().fatal(format!("{e:#}"));
+        }
+        Box::new(Ongoing { result, work_products })
+    }
+    fn join_codegen(
+        &self,
+        ongoing: Box<dyn Any>,
+        sess: &Session,
+        outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
+        let ongoing = ongoing.downcast::<Ongoing>().expect("what codegen_crate returned");
+        let Ongoing { result, work_products } = *ongoing;
+        if !self.rustc_links {
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+            return (CompiledModules { modules: Vec::new(), allocator_module: None }, work_products);
+        }
+        let out = result.expect("an error is fatal in codegen_crate");
+        // The executable that links this crate checks the trait-object drops
+        // of every crate in it against the vtables of every crate in it;
+        // leave this crate's beside each of its outputs.
+        if let Ok(bytes) = postcard::to_allocvec(&out.facts) {
+            for &t in &sess.opts.crate_types {
+                let path = rustc_session::output::out_filename(sess, t, outputs, crate_info.local_crate_name);
+                let _ = std::fs::write(facts_path_for(path.as_path()), &bytes);
+            }
+        }
+        let module = |name: String, path: PathBuf, kind: ModuleKind| CompiledModule {
+            name,
+            kind,
+            object: Some(path),
+            global_asm_object: None,
+            dwarf_object: None,
+            bytecode: None,
+            assembly: None,
+            llvm_ir: None,
+            links_from_incr_cache: Vec::new(),
+        };
+        let modules = out.objects.into_iter().map(|(n, p)| module(n, p, ModuleKind::Regular)).collect();
+        let allocator_module = out.allocator.map(|p| module("athrad-allocator-shim".into(), p, ModuleKind::Allocator));
+        (CompiledModules { modules, allocator_module }, work_products)
+    }
+    fn link(
+        &self,
+        sess: &Session,
+        modules: CompiledModules,
+        info: CrateInfo,
+        metadata: EncodedMetadata,
+        outputs: &OutputFilenames,
+    ) {
+        if self.rustc_links {
+            self.llvm.link(sess, modules, info, metadata, outputs);
+        }
+        // Otherwise the caller of `compile` links, after rustc is done.
+    }
+}
+
+/// Whether `path` is in the sysroot: a crate of the standard library.
+pub(crate) fn in_sysroot(tcx: TyCtxt<'_>, path: &Path) -> bool {
+    let sysroot = tcx.sess.opts.sysroot.path();
+    let canonical = std::fs::canonicalize(sysroot).unwrap_or_else(|_| sysroot.to_owned());
+    path.starts_with(sysroot) || path.starts_with(canonical)
+}
+
+/// Where Athrad keeps a crate's facts: beside its rlib or executable.
+fn facts_path_for(output: &Path) -> PathBuf {
+    let mut p = output.as_os_str().to_owned();
+    p.push(".athrad-facts");
+    PathBuf::from(p)
+}
+
+/// The facts of every crate this one depends on that Athrad compiled. A
+/// dependency outside the sysroot that Athrad did not compile has none, and
+/// its vtables are unknown.
+fn upstream_facts(tcx: TyCtxt<'_>) -> Result<Vec<unwind::Facts>, String> {
+    let mut all = Vec::new();
+    for &cnum in tcx.crates(()) {
+        let src = tcx.used_crate_source(cnum);
+        let Some(lib) = src.rlib.as_ref().or(src.rmeta.as_ref()) else { continue };
+        if in_sysroot(tcx, lib) {
+            continue;
+        }
+        let rlib = lib.with_extension("rlib");
+        match std::fs::read(facts_path_for(&rlib)) {
+            Ok(bytes) => all.push(postcard::from_bytes(&bytes).map_err(|e| e.to_string())?),
+            Err(_) => return Err(format!("`{}` was not compiled by Athrad", tcx.crate_name(cnum))),
+        }
+    }
+    Ok(all)
+}
+
+/// The keys of Athrad's files in a codegen unit's work product.
+const WP_OBJECT: &str = "athrad-o";
+const WP_FACTS: &str = "athrad-facts";
+
 fn lower_crate(
     tcx: TyCtxt<'_>,
     work_dir: &Path,
     codegen: &Codegen,
     work_products: &mut WorkProductMap,
+    rustc_links: bool,
 ) -> Result<Output> {
     if tcx.data_layout.pointer_size().bytes() != 8 || tcx.data_layout.endian != rustc_abi::Endian::Little {
         return Err(unsupported("targets that are not 64-bit little-endian"));
     }
-    if !tcx.crate_types().contains(&CrateType::Executable) {
-        return Err(unsupported("crate types other than `bin`"));
+    for t in tcx.crate_types() {
+        match t {
+            CrateType::Executable => {}
+            CrateType::Rlib if rustc_links => {}
+            other => return Err(unsupported(format!("the `{other}` crate type"))),
+        }
     }
     let sess = tcx.sess;
     let incremental = sess.opts.incremental.is_some();
@@ -231,15 +344,22 @@ fn lower_crate(
         let name = cgu.name().to_string();
         let facts_path = work_dir.join(format!("{name}.facts"));
 
-        if incremental && determine_cgu_reuse(tcx, cgu) != CguReuse::No {
+        // A unit's work product is Athrad's object and facts, under keys of
+        // their own: an incremental directory LLVM also wrote to (a `cargo
+        // build` and an `athrad build` sharing a target directory) must not
+        // hand either backend the other's object.
+        let previous = incremental
+            .then(|| tcx.dep_graph.previous_work_product(&cgu.work_product_id()))
+            .flatten()
+            .filter(|wp| wp.saved_files.contains_key(WP_OBJECT) && wp.saved_files.contains_key(WP_FACTS));
+        if let Some(wp) = previous
+            && determine_cgu_reuse(tcx, cgu) != CguReuse::No
+        {
             let id = cgu.work_product_id();
-            let wp = tcx.dep_graph.previous_work_product(&id).expect("a reused unit has a work product");
-            let (Some(o), Some(f)) = (wp.saved_files.get("o"), wp.saved_files.get("facts")) else {
-                return Err(anyhow!("the work product of `{name}` is not Athrad's"));
-            };
+            let (o, f) = (&wp.saved_files[WP_OBJECT], &wp.saved_files[WP_FACTS]);
             // The session directory is renamed when rustc finishes; link
             // the files from where they are now, or copy them.
-            let obj_path = work_dir.join(o);
+            let obj_path = work_dir.join(format!("{name}.{}", link::ObjectFormat::host().extension()));
             for (file, to) in [(o, &obj_path), (f, &facts_path)] {
                 let from = rustc_incremental::in_incr_comp_dir_sess(sess, file);
                 if std::fs::hard_link(&from, to).is_err() {
@@ -248,7 +368,7 @@ fn lower_crate(
             }
             let facts = std::fs::read(&facts_path)?;
             all_facts.push(postcard::from_bytes(&facts).context("reading a unit's facts")?);
-            objects.push(obj_path);
+            objects.push((name, obj_path));
             work_products.insert(id, wp);
             reused += 1;
             continue;
@@ -273,26 +393,39 @@ fn lower_crate(
         let obj_path = codegen(&module, &name)?;
         std::fs::write(&facts_path, postcard::to_allocvec(&facts)?)?;
         if incremental {
-            let files = [("o", obj_path.as_path()), ("facts", facts_path.as_path())];
+            let files = [(WP_OBJECT, obj_path.as_path()), (WP_FACTS, facts_path.as_path())];
             let (id, wp) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(sess, &name, &files, &[]);
             work_products.insert(id, wp);
         }
         all_facts.push(facts);
-        objects.push(obj_path);
+        objects.push((name, obj_path));
     }
-    unwind::check_trait_objects(&all_facts).map_err(unsupported)?;
+    // A library's trait-object drops are checked when an executable links
+    // it, against every vtable in the program.
+    if tcx.crate_types().contains(&CrateType::Executable) {
+        let upstream = upstream_facts(tcx).map_err(|why| unsupported(format!("this program's dependencies: {why}")))?;
+        let mut checked = all_facts.clone();
+        checked.extend(upstream);
+        unwind::check_trait_objects(&checked).map_err(unsupported)?;
+    }
 
     // The allocator shim depends on no unit; it is small enough to make
     // every time.
     let mut m = ModCx::new(tcx);
     allocator_shim(&mut m);
     let shim = m.finish();
-    if !shim.functions.is_empty() {
-        objects.push(codegen(&shim, "athrad-allocator-shim")?);
-    }
+    let allocator = if shim.functions.is_empty() { None } else { Some(codegen(&shim, "athrad-allocator-shim")?) };
 
-    let link = link_inputs(tcx)?;
-    Ok(Output { objects, link, lower_time, reused, units: parts.codegen_units.len() })
+    let link = if rustc_links { None } else { Some(link_inputs(tcx)?) };
+    Ok(Output {
+        objects,
+        allocator,
+        link,
+        facts: unwind::Facts::merged(&all_facts),
+        lower_time,
+        reused,
+        units: parts.codegen_units.len(),
+    })
 }
 
 /// Lower one codegen unit to its own module: everything it defines, the

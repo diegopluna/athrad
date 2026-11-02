@@ -1,0 +1,4 @@
+# A crate with modules and a path dependency, for the oracle.
+[workspace]
+resolver = "3"
+members = ["app", "geom"]

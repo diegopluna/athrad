@@ -90,8 +90,8 @@ pub fn build_cached(
     };
     t.rustc = rustc_total.saturating_sub(t.lower + t.codegen);
 
-    let mut inputs = out.link;
-    inputs.objects.splice(0..0, out.objects);
+    let mut inputs = out.link.expect("an executable has link inputs");
+    inputs.objects.splice(0..0, out.objects.into_iter().map(|(_, p)| p).chain(out.allocator));
     let start = Instant::now();
     linker.link(&inputs, output)?;
     t.link = start.elapsed();
@@ -187,4 +187,65 @@ fn run_rustc(
         args.extend(extra.split_whitespace().map(str::to_owned));
     }
     frontend::compile(&args, work_dir, codegen)
+}
+
+/// Be `rustc` for Cargo, which runs `RUSTC_WRAPPER RUSTC ARGS...`: compile
+/// with Athrad generating the code, and `rustc` linking it. `args` are
+/// `rustc`'s, without the program name. Returns `rustc`'s exit code.
+///
+/// The per-function code cache sits beside the crate's incremental
+/// directory when Cargo gives one (it does for the workspace's own crates),
+/// and is in memory otherwise.
+pub fn rustc_wrapper(args: &[String]) -> std::process::ExitCode {
+    let mut rustc_args = vec!["rustc".to_owned()];
+    rustc_args.extend(args.iter().cloned());
+    let codegen_opt = |key: &str| {
+        args.iter().enumerate().find_map(|(i, a)| {
+            let value = if a == "-C" { args.get(i + 1).map(String::as_str) } else { a.strip_prefix("-C") };
+            value.and_then(|v| v.strip_prefix(key)).map(str::to_owned)
+        })
+    };
+    let crate_name = args.iter().position(|a| a == "--crate-name").and_then(|i| args.get(i + 1));
+    // Cargo's incremental directory is shared by the package's crates, each
+    // in a directory of its own named by crate name and a hash; the cache
+    // goes beside, by crate name and `-C metadata`.
+    let cache_path = match (codegen_opt("incremental="), crate_name) {
+        (Some(dir), Some(name)) => {
+            let meta = codegen_opt("metadata=").unwrap_or_default();
+            Some(PathBuf::from(dir).join(format!("{name}-{meta}.athrad-code")))
+        }
+        _ => None,
+    };
+    let cache = match &cache_path {
+        Some(p) => codegen::Cache::load(p).unwrap_or_default(),
+        None => codegen::Cache::in_memory(),
+    };
+    let work_dir = std::env::temp_dir().join(format!("athrad-rustc-{}", std::process::id()));
+    let state = Arc::new(Mutex::new(CodegenState { cache, ..Default::default() }));
+    let codegen_fn: frontend::Codegen = {
+        let state = state.clone();
+        let dir = work_dir.clone();
+        Arc::new(move |module: &ir::Module, unit: &str| {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.codegen(module, unit, &dir)
+        })
+    };
+    let start = Instant::now();
+    let code = frontend::run_as_rustc(&rustc_args, &work_dir, codegen_fn);
+    let _ = std::fs::remove_dir_all(&work_dir);
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var_os("ATHRAD_TIME").is_some() && state.stats != codegen::Stats::default() {
+        eprintln!(
+            "athrad: {} in {:.1} ms; codegen {:.1} ms ({} functions cached, {} compiled)",
+            crate_name.map(String::as_str).unwrap_or("?"),
+            start.elapsed().as_secs_f64() * 1e3,
+            state.codegen_time.as_secs_f64() * 1e3,
+            state.stats.hits,
+            state.stats.misses
+        );
+    }
+    if cache_path.is_some() {
+        let _ = state.cache.save();
+    }
+    code
 }

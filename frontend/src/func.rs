@@ -1108,9 +1108,6 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     BinOp::SubWithOverflow => OverflowOp::Sub,
                     _ => OverflowOp::Mul,
                 });
-                if self.b.value_type(x) == Type::I128 && o == OverflowOp::Mul {
-                    return Err(unsupported("multiplication overflow checks on 128-bit integers"));
-                }
                 let (r, of) = self.b.overflow(o, s, x, y);
                 return Ok(Val { v: V::Pair(r, of), layout: dest });
             }

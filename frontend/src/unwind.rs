@@ -193,8 +193,19 @@ struct DynDropFact {
     at: String,
 }
 
+impl Facts {
+    /// One crate's facts, from its units'.
+    pub(crate) fn merged(all: &[Facts]) -> Facts {
+        Facts {
+            vtables: all.iter().flat_map(|f| f.vtables.iter().cloned()).collect(),
+            dyn_drops: all.iter().flat_map(|f| f.dyn_drops.iter().cloned()).collect(),
+        }
+    }
+}
+
 /// Each trait object some cleanup would drop must only ever hold types whose
-/// drop may be skipped, across every codegen unit's vtables.
+/// drop may be skipped, across every codegen unit's vtables, and those of the
+/// crates this one depends on (given as more `Facts`).
 pub(crate) fn check_trait_objects(all: &[Facts]) -> Result<(), String> {
     for d in all.iter().flat_map(|f| &f.dyn_drops) {
         for v in all.iter().flat_map(|f| &f.vtables) {
@@ -212,10 +223,14 @@ pub(crate) fn check_trait_objects(all: &[Facts]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether `did` comes from the standard library. Until milestone 3 there
-/// are no other dependencies, so that is every crate but the program's.
-fn is_standard(_tcx: TyCtxt<'_>, did: DefId) -> bool {
-    !did.is_local()
+/// Whether `did` comes from the standard library: a crate in the sysroot.
+/// A dependency from crates.io or a path is the program's own code here, and
+/// its `Drop` impls count as the program's.
+fn is_standard(tcx: TyCtxt<'_>, did: DefId) -> bool {
+    if did.is_local() {
+        return false;
+    }
+    tcx.used_crate_source(did.krate).paths().any(|p| crate::in_sysroot(tcx, p))
 }
 
 fn def_path(tcx: TyCtxt<'_>, did: DefId) -> String {

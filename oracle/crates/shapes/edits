@@ -1,0 +1,8 @@
+# Each line is one edit, made after the one before: FILE: FROM ==> TO, with
+# ` ;; ` between replacements that only compile together.
+geom/src/lib.rs: Shape::Rect { w, h } => w * h, ==> Shape::Rect { w, h } => w * h + 0.5,
+app/src/report/fmt.rs: {a:.2} ==> {a:.3}
+geom/src/lib.rs: Rect { w: f64, h: f64 }, ==> Rect { w: f64, h: f64 }, Tri { b: f64, h: f64 }, ;; geom/src/lib.rs: Shape::Rect { .. } => "rect", ==> Shape::Rect { .. } => "rect", Shape::Tri { .. } => "tri", ;; geom/src/lib.rs: Shape::Rect { w, h } => w * h + 0.5, ==> Shape::Rect { w, h } => w * h + 0.5, Shape::Tri { b, h } => b * h / 2.0,
+app/src/main.rs: Shape::square(1.5)] ==> Shape::square(1.5), Shape::Tri { b: 2.0, h: 3.0 }]
+geom/src/lib.rs: pub fn total_area( ==> pub fn sum_areas( ;; app/src/main.rs: use geom::{Shape, total_area}; ==> use geom::{Shape, sum_areas as total_area};
+app/src/util.rs: s.to_uppercase() ==> s.to_uppercase().repeat(2)

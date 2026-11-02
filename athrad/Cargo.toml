@@ -20,3 +20,6 @@ notify.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+oracle = { path = "../oracle" }

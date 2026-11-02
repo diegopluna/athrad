@@ -286,3 +286,137 @@ mod tests {
         assert_eq!(super::mask_thread_ids(s), b"\nthread 'main' (N) panicked at a.rs:2:5:\nthread 'x' (no)\n");
     }
 }
+
+/// A Cargo project the oracle builds with `cargo build` and with
+/// `athrad build`, in `oracle/crates`.
+#[derive(Clone, Debug)]
+pub struct Crate {
+    pub name: String,
+    pub dir: PathBuf,
+}
+
+/// The projects in `oracle/crates`, sorted by name.
+pub fn crates() -> Result<Vec<Crate>> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates");
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        if path.join("Cargo.toml").exists() {
+            let name = path.file_name().and_then(|s| s.to_str()).context("crate name")?.to_owned();
+            out.push(Crate { name, dir: path });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Build `krate` with `cargo build` (that is, `rustc`) and with `athrad
+/// build` (the `athrad` executable at `athrad`), run the binary each makes,
+/// and fail unless they agree. Then make each edit in the project's `edits`
+/// file in turn (`FILE: FROM ==> TO`), rebuilding both and comparing again,
+/// so Athrad's incremental rebuilds across crates are checked too. Returns
+/// how many builds agreed.
+pub fn check_crate(krate: &Crate, athrad: &Path, work_dir: &Path) -> Result<usize> {
+    let dir = work_dir.join("crates").join(&krate.name);
+    let _ = std::fs::remove_dir_all(&dir);
+    copy_tree(&krate.dir, &dir)?;
+    let edits: Vec<Vec<(String, String, String)>> = match std::fs::read_to_string(dir.join("edits")) {
+        Ok(text) => text
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                l.split(" ;; ")
+                    .map(|part| {
+                        let (file, rest) = part.split_once(": ").context("an edit without `FILE: `")?;
+                        let (from, to) = rest.split_once(" ==> ").context("an edit without ` ==> `")?;
+                        Ok((file.to_owned(), from.to_owned(), to.to_owned()))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Result<Vec<_>>>()?,
+        Err(_) => Vec::new(),
+    };
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let build = |wrapper: Option<&Path>| -> Result<PathBuf> {
+        let mut c = Command::new(wrapper.unwrap_or(Path::new(&cargo)));
+        if wrapper.is_some() {
+            c.env("CARGO", &cargo);
+        }
+        c.current_dir(&dir)
+            .arg("build")
+            .args(["--quiet", "--message-format", "short"])
+            .env_remove("RUSTC_BOOTSTRAP")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("RUSTFLAGS");
+        let out = c.output().context("running cargo")?;
+        let who = if wrapper.is_some() { "athrad build" } else { "cargo build" };
+        if !out.status.success() {
+            bail!("{who} failed on `{}`:\n{}", krate.name, String::from_utf8_lossy(&out.stderr));
+        }
+        let target = if wrapper.is_some() { dir.join("target/athrad/debug") } else { dir.join("target/debug") };
+        // The project's one binary.
+        let bins: Vec<PathBuf> = std::fs::read_dir(&target)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_file() && is_executable(p))
+            .collect();
+        match bins.as_slice() {
+            [one] => Ok(one.clone()),
+            _ => bail!("{who} of `{}` made {} executables", krate.name, bins.len()),
+        }
+    };
+    let mut agreed = 0;
+    for step in 0..=edits.len() {
+        for (file, from, to) in edits.get(step.wrapping_sub(1)).into_iter().flatten() {
+            let path = dir.join(file);
+            let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+            if !text.contains(from.as_str()) {
+                bail!("`{}`: edit {step} finds no `{from}` in {file}", krate.name);
+            }
+            std::fs::write(&path, text.replacen(from.as_str(), to, 1))?;
+        }
+        let rustc_exe = build(None)?;
+        let athrad_exe = build(Some(athrad)).map_err(|e| Rejected(format!("{e:#}")))?;
+        let (rustc, athrad_run) = (run(&rustc_exe)?, run(&athrad_exe)?);
+        if rustc != athrad_run {
+            bail!(
+                "`{}` after edit {step}: Athrad disagrees with rustc\nrustc:\n{rustc}\nathrad:\n{athrad_run}",
+                krate.name
+            );
+        }
+        agreed += 1;
+    }
+    Ok(agreed)
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let (src, dst) = (entry.path(), to.join(entry.file_name()));
+        if entry.file_name() == "target" {
+            continue;
+        }
+        if entry.file_type()?.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_executable(p: &Path) -> bool {
+    if cfg!(windows) {
+        return p.extension().is_some_and(|e| e == "exe");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+    }
+    #[allow(unreachable_code)]
+    false
+}

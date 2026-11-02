@@ -399,11 +399,12 @@ fn lower(
                         ir::UnOp::Bitrev => ins.bitrev(x),
                     }]
                 }
-                ir::Op::Overflow(op @ (ir::OverflowOp::Add | ir::OverflowOp::Sub), signed, x, y)
-                    if func.values[x.0 as usize] == ir::Type::I128 =>
-                {
+                ir::Op::Overflow(op, signed, x, y) if func.values[x.0 as usize] == ir::Type::I128 => {
                     let (x, y) = (get(&values, *x), get(&values, *y));
-                    let (r, of) = addsub128_overflow(&mut b, *op, *signed, x, y);
+                    let (r, of) = match op {
+                        ir::OverflowOp::Mul => mul128_overflow(&mut b, *signed, x, y),
+                        _ => addsub128_overflow(&mut b, *op, *signed, x, y),
+                    };
                     vec![r, of]
                 }
                 ir::Op::Overflow(op, signed, x, y) => {
@@ -685,6 +686,69 @@ fn addsub128_overflow(
         b.ins().icmp(IntCC::SignedLessThan, both, zero)
     };
     (r, of)
+}
+
+/// 128-bit multiplication with an overflow flag, from 64-bit halves:
+/// Cranelift's overflow multiply stops at 64 bits.
+fn mul128_overflow(
+    b: &mut FunctionBuilder,
+    signed: bool,
+    x: clif::Value,
+    y: clif::Value,
+) -> (clif::Value, clif::Value) {
+    let r = b.ins().imul(x, y);
+    if !signed {
+        let of = umul128_overflows(b, x, y);
+        return (r, of);
+    }
+    // Multiply the magnitudes; the signed result fits when the magnitude
+    // fits in 127 bits, or is exactly 2^127 for a negative result.
+    let zero = b.ins().iconst(types::I64, 0);
+    let zero = b.ins().uextend(types::I128, zero);
+    let xn = b.ins().icmp(IntCC::SignedLessThan, x, zero);
+    let yn = b.ins().icmp(IntCC::SignedLessThan, y, zero);
+    let nx = b.ins().ineg(x);
+    let ny = b.ins().ineg(y);
+    let ax = b.ins().select(xn, nx, x);
+    let ay = b.ins().select(yn, ny, y);
+    let uof = umul128_overflows(b, ax, ay);
+    let m = b.ins().imul(ax, ay);
+    let neg = b.ins().bxor(xn, yn);
+    let (lo, hi) = b.ins().isplit(m);
+    let top = b.ins().ushr_imm_u(hi, 63);
+    let top_set = b.ins().icmp_imm_u(IntCC::NotEqual, top, 0);
+    // 2^127: hi = 1 << 63, lo = 0.
+    let min_hi = b.ins().iconst(types::I64, i64::MIN);
+    let is_min_hi = b.ins().icmp(IntCC::Equal, hi, min_hi);
+    let lo_zero = b.ins().icmp_imm_u(IntCC::Equal, lo, 0);
+    let is_min = b.ins().band(is_min_hi, lo_zero);
+    let fits_neg = b.ins().bnot(is_min);
+    let neg_bad = b.ins().band(top_set, fits_neg);
+    let sof = b.ins().select(neg, neg_bad, top_set);
+    let of = b.ins().bor(uof, sof);
+    (r, of)
+}
+
+/// Whether the unsigned 128-bit product of `x` and `y` overflows.
+fn umul128_overflows(b: &mut FunctionBuilder, x: clif::Value, y: clif::Value) -> clif::Value {
+    let (x0, x1) = b.ins().isplit(x);
+    let (y0, y1) = b.ins().isplit(y);
+    let x1nz = b.ins().icmp_imm_u(IntCC::NotEqual, x1, 0);
+    let y1nz = b.ins().icmp_imm_u(IntCC::NotEqual, y1, 0);
+    let both = b.ins().band(x1nz, y1nz);
+    let carry = b.ins().umulhi(x0, y0);
+    let t1 = b.ins().imul(x1, y0);
+    let t1h = b.ins().umulhi(x1, y0);
+    let t2 = b.ins().imul(x0, y1);
+    let t2h = b.ins().umulhi(x0, y1);
+    let t1hi = b.ins().icmp_imm_u(IntCC::NotEqual, t1h, 0);
+    let t2hi = b.ins().icmp_imm_u(IntCC::NotEqual, t2h, 0);
+    let (s, c1) = b.ins().uadd_overflow(t1, t2);
+    let (_, c2) = b.ins().uadd_overflow(s, carry);
+    let of = b.ins().bor(both, t1hi);
+    let of = b.ins().bor(of, t2hi);
+    let of = b.ins().bor(of, c1);
+    b.ins().bor(of, c2)
 }
 
 /// Rust's float-to-integer `as`: toward zero, saturating at the type's

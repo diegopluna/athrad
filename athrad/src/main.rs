@@ -1,166 +1,67 @@
-//! `athrad FILE.rs [-o OUTPUT]`: build a one-file binary crate, as
-//! `rustc --edition 2024 FILE.rs` would.
+//! `athrad`, the command.
 //!
-//! `athrad watch FILE.rs [-o OUTPUT] [--run]`: build it, then build again on
-//! every change to it, from a process that stays warm: the linker found
-//! once, every function's machine code in memory. With `--run`, run the
-//! program after each build.
+//! * `athrad build [CARGO ARGS]`, `athrad run [CARGO ARGS]`: `cargo build`
+//!   and `cargo run` with Athrad compiling every crate, the package's and
+//!   its dependencies'. Cargo runs `athrad-driver` as its `RUSTC_WRAPPER`,
+//!   and the output goes to `target/athrad`, apart from `rustc`'s.
+//! * `athrad FILE.rs [-o OUT]`, `athrad watch FILE.rs [-o OUT] [--run]`: one
+//!   file, without Cargo; see `athrad-driver`.
 //!
-//! Set `ATHRAD_TIME` to see where each build's time went.
-
-#![feature(rustc_private)]
-
-extern crate rustc_driver;
+//! This program does not link the compiler, so it starts in a millisecond
+//! (`rustc_driver` takes 20 ms to load); it hands everything to
+//! `athrad-driver`, which sits beside it.
 
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
-use std::time::Instant;
-
-use anyhow::{Context, Result, bail};
-use athrad::watch::{Change, OsWatcher, Watcher};
-
-struct Args {
-    watch: bool,
-    run: bool,
-    source: PathBuf,
-    output: PathBuf,
-    stem: String,
-}
-
-fn parse_args() -> Result<Args> {
-    let mut args = std::env::args_os().skip(1).peekable();
-    let watch = args.peek().is_some_and(|a| a == "watch");
-    if watch {
-        args.next();
-    }
-    let (mut source, mut output, mut run) = (None, None, false);
-    while let Some(arg) = args.next() {
-        if arg == "-o" {
-            output = args.next().map(PathBuf::from);
-        } else if arg == "--run" && watch {
-            run = true;
-        } else if source.is_none() {
-            source = Some(PathBuf::from(arg));
-        } else {
-            bail!("unexpected argument {}", arg.to_string_lossy());
-        }
-    }
-    let Some(source) = source else {
-        bail!("usage: athrad FILE.rs [-o OUTPUT]\n       athrad watch FILE.rs [-o OUTPUT] [--run]");
-    };
-    let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("main").to_owned();
-    let output = output.unwrap_or_else(|| PathBuf::from(link::executable_name(&stem)));
-    Ok(Args { watch, run, source, output, stem })
-}
+use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
-    let result = parse_args().and_then(|args| if args.watch { watch(&args) } else { build_once(&args) });
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {e}");
             ExitCode::FAILURE
         }
     }
 }
 
-/// What is kept between runs, next to the output in `.athrad/`: each
-/// function's machine code in `STEM.cache`, and `rustc`'s incremental
-/// state, with each codegen unit's object, in `STEM.incr/`.
-fn caches(args: &Args) -> Result<athrad::Caches> {
-    let dir = args.output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let dir = dir.join(".athrad");
-    Ok(athrad::Caches {
-        code: codegen::Cache::load(&dir.join(format!("{}.cache", args.stem)))?,
-        incremental: Some(dir.join(format!("{}.incr", args.stem))),
+fn run(args: &[String]) -> Result<ExitCode, String> {
+    let me = std::env::current_exe().map_err(|e| format!("finding the athrad executable: {e}"))?;
+    let driver = me.with_file_name(format!("athrad-driver{}", std::env::consts::EXE_SUFFIX));
+    if !driver.exists() {
+        return Err(format!("{} is missing", driver.display()));
+    }
+    let status = match args.first().map(String::as_str) {
+        Some(cmd @ ("build" | "run")) => {
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let mut c = Command::new(&cargo);
+            c.arg(cmd).args(&args[1..]).env("RUSTC_WRAPPER", &driver);
+            if std::env::var_os("CARGO_TARGET_DIR").is_none() && !args.iter().any(|a| a.starts_with("--target-dir")) {
+                let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+                c.env("CARGO_TARGET_DIR", workspace_root(&cwd)?.join("target").join("athrad"));
+            }
+            c.status().map_err(|e| format!("running {}: {e}", cargo.to_string_lossy()))?
+        }
+        _ => Command::new(&driver).args(args).status().map_err(|e| format!("running {}: {e}", driver.display()))?,
+    };
+    Ok(match status.code() {
+        Some(0) => ExitCode::SUCCESS,
+        Some(n) => ExitCode::from(u8::try_from(n).unwrap_or(1)),
+        None => ExitCode::FAILURE,
     })
 }
 
-fn work_dir(args: &Args) -> PathBuf {
-    std::env::temp_dir().join(format!("athrad-{}-{}", args.stem, std::process::id()))
-}
-
-fn timing() -> bool {
-    std::env::var_os("ATHRAD_TIME").is_some()
-}
-
-fn build(args: &Args, linker: &link::HostCc, caches: &mut athrad::Caches, work_dir: &Path) -> Result<athrad::Timings> {
-    let result = athrad::build_cached(&args.source, linker, caches, work_dir, &args.output);
-    caches.code.save()?;
-    let t = result?;
-    // Rewrite the file once dead entries outnumber live ones. Functions in
-    // reused units were not looked up, so count only after a full build.
-    if t.reused_units == 0 && caches.code.len() > 2 * (t.cache.hits + t.cache.misses) {
-        caches.code.compact()?;
-    }
-    Ok(t)
-}
-
-fn build_once(args: &Args) -> Result<()> {
-    let linker = link::HostCc::new()?;
-    let mut caches = caches(args)?;
-    let work_dir = work_dir(args);
-    let result = build(args, &linker, &mut caches, &work_dir);
-    let _ = std::fs::remove_dir_all(&work_dir);
-    let t = result?;
-    if timing() {
-        eprintln!("athrad: {t}");
-    }
-    Ok(())
-}
-
-fn watch(args: &Args) -> Result<()> {
-    let mut linker = link::HostCc::new()?;
-    linker.resolve();
-    let mut caches = caches(args)?;
-    let work_dir = work_dir(args);
-    let source = std::fs::canonicalize(&args.source).with_context(|| format!("finding {}", args.source.display()))?;
-    let dir = source.parent().context("the source's directory")?.to_owned();
-
-    let mut watcher = OsWatcher::new().context("starting the file watcher")?;
-    // Editors often save by writing a new file and renaming it over the old
-    // one, so watch the directory and pick out the file.
-    watcher.watch(&dir).with_context(|| format!("watching {}", dir.display()))?;
-
-    let mut last: Option<Vec<u8>> = None;
-    let mut rebuild = true;
-    loop {
-        if rebuild {
-            let contents = std::fs::read(&source).ok();
-            if contents.is_some() && contents != last {
-                let start = Instant::now();
-                let result = build(args, &linker, &mut caches, &work_dir);
-                let ms = start.elapsed().as_secs_f64() * 1e3;
-                match result {
-                    Ok(t) => {
-                        eprintln!("athrad: built {} in {ms:.1} ms", args.output.display());
-                        if timing() {
-                            eprintln!("athrad: {t}");
-                        }
-                        if args.run {
-                            run(&args.output);
-                        }
-                    }
-                    Err(e) => eprintln!("athrad: error: {e:#}"),
-                }
-                last = contents;
-            }
+/// The directory of the workspace the current directory is in, as Cargo
+/// finds it: the nearest `Cargo.toml` up from `dir`, or an ancestor's that
+/// has a `[workspace]` table. (Asking `cargo locate-project` costs 37 ms.)
+fn workspace_root(dir: &Path) -> Result<PathBuf, String> {
+    let mut package = None;
+    for d in dir.ancestors() {
+        let Ok(text) = std::fs::read_to_string(d.join("Cargo.toml")) else { continue };
+        if text.lines().any(|l| l.trim() == "[workspace]") {
+            return Ok(d.to_owned());
         }
-        // Any change in the directory sends Athrad to look at the file, and
-        // it builds only if the file's contents changed. Backends name
-        // renamed files unreliably (kqueue keeps an inode's first name), so
-        // the event's path is not trusted to say which file changed.
-        let changes = watcher.wait(None)?;
-        rebuild = changes.iter().any(|c| !matches!(c, Change::Removed(_)));
+        package.get_or_insert_with(|| d.to_owned());
     }
-}
-
-fn run(exe: &Path) {
-    // A bare name would be looked up on PATH.
-    let exe = if exe.components().count() == 1 { Path::new(".").join(exe) } else { exe.to_owned() };
-    match std::process::Command::new(&exe).status() {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("athrad: {} exited with {status}", exe.display()),
-        Err(e) => eprintln!("athrad: running {}: {e}", exe.display()),
-    }
+    package.ok_or_else(|| "could not find `Cargo.toml` in this directory or any above it".into())
 }

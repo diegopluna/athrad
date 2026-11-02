@@ -30,6 +30,7 @@ dependencies = [
  "ir",
  "link",
  "notify",
+ "oracle",
 ]
 
 [[package]]

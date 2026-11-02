@@ -241,9 +241,6 @@ impl Checker<'_> {
             }
             Op::Overflow(op, _, a, b) => {
                 let t = same(*a, *b, op)?;
-                if t == Type::I128 && *op == crate::OverflowOp::Mul {
-                    return Err(format!("{op:?} overflow check of i128"));
-                }
                 vec![t, Type::I8]
             }
             Op::Cmp(c, a, b) => {
