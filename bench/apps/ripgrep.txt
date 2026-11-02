@@ -1,5 +1,6 @@
 # ripgrep 14 over $CORPUS (the Rust compiler's source, from rustc-src).
-# `--sort path` makes every search's output deterministic.
+# `--sort path` makes every search's output deterministic. (`--json` is not:
+# it reports elapsed times.)
 {bin} --sort path -c fn $CORPUS
 {bin} --sort path -n "impl<'tcx> [A-Z][a-z]+For" $CORPUS
 {bin} --sort path -i -c unsafe $CORPUS
@@ -8,7 +9,7 @@
 {bin} --sort path -c -F TyCtxt $CORPUS
 {bin} --sort path -o -c "\b[0-9]{4,}\b" $CORPUS
 {bin} --sort path -l -U "struct \w+ \{\n\s+pub" $CORPUS
-{bin} --sort path --json -m 1 "fn main" $CORPUS
+{bin} --sort path --vimgrep -m 1 "fn main" $CORPUS
 {bin} --sort path -C2 "panic!\(\"internal" $CORPUS
 {bin} --sort path -c -t rust "\.unwrap\(\)" $CORPUS
 {bin} --version

@@ -319,3 +319,19 @@ Results on `bench/release`, every output identical to cargo's:
 | run time, geomean / worst | 0.999x / 1.04x | 1.02x / 1.13x (regex) |
 
 Why the build barely moves: in a release build LLVM is about a third of a crate's time (`regex_automata`: 0.57 s of 1.68 s), and of what LLVM still gets after the split, nearly all is `#[inline]` copies the hot code needs (`regex_automata`: 31 hot functions, 386 held by the rules, 3,922 copies). Pruning copies only cold code used saved 3% and broke a link through a static. The edited crate of each workload is the workload, and all of it is hot: `json`'s LLVM time is the same either way. Per crate, the parallel frontend helps more than the split (`regex_automata` 1.68 s to 1.12 s), but cargo already builds crates in parallel. A program with much more cold code than hot (an application rather than a benchmark) is where the split should pay; these workloads cannot show it.
+
+#### ripgrep, and the rules that made tiering pay
+
+`scripts/app_bench.py` builds a real application with cargo and with the tiered build and runs a workload against both, requiring the same output; `bench/apps/ripgrep.txt` is thirteen ripgrep 14.1.1 searches over the compiler's source (42 MB, 2,870 files). All of it was built and measured on boat.dev (AMD Ryzen 7 9700X, 4 vCPU).
+
+The first run was slower than cargo on every count: LLVM still got 14,380 of ripgrep's 19,710 functions, 1,026 of them held because they called a hot `#[inline]` helper. In an application that is nearly everything (`Vec::push` is hot because thousands of functions call it). The rule now follows only helpers with at most two callers (`FEW_CALLERS`), the kind specialized to one caller's closure; ripgrep's held functions went from 1,181 to 52. Pruning the `#[inline]` copies only cold code needs now also walks statics' initializers (a `LazyLock` closure shim was the symbol a link lost before).
+
+That made builds fast and runs slow: one-time work per run (arguments, regex compilation, searcher set-up) is thousands of functions under the 10,000-block cut. The hot list now also takes the hottest functions until Cranelift's half executed at most a given share of all blocks (`HOT_SHARE`, `ATHRAD_HOT_SHARE`). On ripgrep:
+
+| Cranelift's share of executed blocks | hot functions | clean build | edit (`crates/core/main.rs`) | run geomean / worst |
+|---|---|---|---|---|
+| 0.01% | 3,534 | 0.73x | 0.48x | 1.065x / 1.13x |
+| 0.001% | 5,877 | 0.79x | 0.56x | 1.033x / 1.24x |
+| 0.0001% (default) | 7,130 | 0.83x | 0.71x | 0.974x / 1.07x |
+
+At the default, `bench/release` runs at 0.98x (worst 1.04x) and builds clean in 0.89x; its one-file edit is 1.27x, because the edited crate is the benchmark and all of it is hot. cargo's own clean build of ripgrep ranged from 13.9 s to 17.3 s across these runs, so read differences under about 5% as noise. The commands are 2 to 30 ms each, mostly start-up; a workload that searches more would leave more to Cranelift.

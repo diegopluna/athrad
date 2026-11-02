@@ -40,6 +40,10 @@ pub(crate) struct Tier {
 
 pub(crate) static TIER: OnceLock<Tier> = OnceLock::new();
 
+/// A hot `#[inline]` helper with at most this many callers is taken to run
+/// its hot code for them (see `split`).
+const FEW_CALLERS: usize = 2;
+
 type PartitionFn = for<'tcx> fn(TyCtxt<'tcx>, ()) -> MonoItemPartitions<'tcx>;
 
 /// `rustc`'s own partitioning, which [`partition`] wraps.
@@ -174,6 +178,8 @@ fn split<'tcx>(
     let cold_roots: HashSet<MonoItem<'tcx>> = work.iter().map(|&(item, _)| item).collect();
 
     let mut lowered: HashMap<MonoItem<'tcx>, Lowered> = lower_all(tcx, work).into_iter().collect();
+    // Why cold functions went back to LLVM, for `ATHRAD_TIME`.
+    let failed_to_lower = lowered.values().filter(|l| l.is_none()).count();
 
     // Copies of the `#[inline]` functions the cold ones call, as LLVM's
     // units have their own, until no lowered function imports one.
@@ -197,54 +203,7 @@ fn split<'tcx>(
         lowered.extend(lower_all(tcx, more));
     }
 
-    // A cold function that calls a hot `#[inline]` function, directly or
-    // through other copies, stays with LLVM: LLVM would inline the hot code
-    // into it, and its own count says nothing about that code (a function
-    // run once can hold the whole hot loop, as `Map::fold` does).
-    let mut reaches_hot: HashMap<String, bool> = HashMap::new();
-    let imports_of: HashMap<String, Vec<String>> = lowered
-        .iter()
-        .filter(|(item, _)| !cold_roots.contains(item))
-        .filter_map(|(item, l)| {
-            let (module, _) = l.as_ref()?;
-            Some((item.symbol_name(tcx).name.to_owned(), module.imports.iter().map(|i| i.name.clone()).collect()))
-        })
-        .collect();
-    fn hot_through(
-        name: &str,
-        hot: &HashSet<String>,
-        imports_of: &HashMap<String, Vec<String>>,
-        memo: &mut HashMap<String, bool>,
-    ) -> bool {
-        if let Some(&known) = memo.get(name) {
-            return known;
-        }
-        memo.insert(name.to_owned(), false); // a cycle adds nothing
-        let result = hot.contains(name)
-            || imports_of.get(name).is_some_and(|is| is.iter().any(|i| hot_through(i, hot, imports_of, memo)));
-        memo.insert(name.to_owned(), result);
-        result
-    }
-    for (item, l) in lowered.iter_mut() {
-        if !cold_roots.contains(item) {
-            continue;
-        }
-        let Some((module, _)) = l else { continue };
-        let calls_hot_inline = module.imports.iter().any(|i| {
-            by_symbol.get(&i.name).is_some_and(|(_, d)| d.inlined)
-                && hot_through(&i.name, &tier.hot, &imports_of, &mut reaches_hot)
-        });
-        if calls_hot_inline {
-            *l = None;
-        }
-    }
-
-    // LLVM inlines a function with one caller into that caller, whatever
-    // its size, and that is often where a hot loop meets what it knows about
-    // its data (`spec_extend` inlining `extend_trusted`: the vector has room
-    // already). So a cold function that is the only caller of a function in
-    // LLVM's half that is hot, or that stays in LLVM by these rules, stays
-    // in LLVM too, and so on up a chain of single callers.
+    // How many functions call each function, from the collector's graph.
     let mut callers: HashMap<MonoItem<'tcx>, usize> = HashMap::new();
     for &(item, _) in &items {
         let MonoItem::Fn(instance) = item else { continue };
@@ -258,6 +217,68 @@ fn split<'tcx>(
             }
         }
     }
+
+    // A cold function that calls a hot `#[inline]` function, directly or
+    // through other copies, stays with LLVM: LLVM would inline the hot code
+    // into it, and its own count says nothing about that code (a function
+    // run once can hold the whole hot loop, as `Map::fold` does). Only
+    // helpers with at most [`FEW_CALLERS`] callers count: one specialized to
+    // its caller's closure runs its loop for that caller, while `Vec::push`
+    // is hot because thousands of functions call it a few times each.
+    let mut reaches_hot: HashMap<String, bool> = HashMap::new();
+    let mut held_hot_inline = 0usize;
+    let imports_of: HashMap<String, Vec<String>> = lowered
+        .iter()
+        .filter(|(item, _)| !cold_roots.contains(item))
+        .filter_map(|(item, l)| {
+            let (module, _) = l.as_ref()?;
+            Some((item.symbol_name(tcx).name.to_owned(), module.imports.iter().map(|i| i.name.clone()).collect()))
+        })
+        .collect();
+    let few_callers = |name: &str| -> bool {
+        by_symbol.get(name).is_some_and(|(item, _)| callers.get(item).copied().unwrap_or(0) <= FEW_CALLERS)
+    };
+    fn hot_through(
+        name: &str,
+        hot: &HashSet<String>,
+        imports_of: &HashMap<String, Vec<String>>,
+        few_callers: &dyn Fn(&str) -> bool,
+        memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        if let Some(&known) = memo.get(name) {
+            return known;
+        }
+        memo.insert(name.to_owned(), false); // a cycle adds nothing
+        let result = few_callers(name)
+            && (hot.contains(name)
+                || imports_of
+                    .get(name)
+                    .is_some_and(|is| is.iter().any(|i| hot_through(i, hot, imports_of, few_callers, memo))));
+        memo.insert(name.to_owned(), result);
+        result
+    }
+    for (item, l) in lowered.iter_mut() {
+        if !cold_roots.contains(item) {
+            continue;
+        }
+        let Some((module, _)) = l else { continue };
+        let calls_hot_inline = module.imports.iter().any(|i| {
+            by_symbol.get(&i.name).is_some_and(|(_, d)| d.inlined)
+                && hot_through(&i.name, &tier.hot, &imports_of, &few_callers, &mut reaches_hot)
+        });
+        if calls_hot_inline {
+            *l = None;
+            held_hot_inline += 1;
+        }
+    }
+
+    let mut held_sole_caller = 0usize;
+    // LLVM inlines a function with one caller into that caller, whatever
+    // its size, and that is often where a hot loop meets what it knows about
+    // its data (`spec_extend` inlining `extend_trusted`: the vector has room
+    // already). So a cold function that is the only caller of a function in
+    // LLVM's half that is hot, or that stays in LLVM by these rules, stays
+    // in LLVM too, and so on up a chain of single callers.
     loop {
         // In LLVM's half, and worth inlining into a sole caller.
         let llvm_hot = |name: &str, lowered: &HashMap<MonoItem<'tcx>, Lowered>| -> bool {
@@ -284,6 +305,7 @@ fn split<'tcx>(
         if moved.is_empty() {
             break;
         }
+        held_sole_caller += moved.len();
         for item in moved {
             lowered.insert(item, None);
         }
@@ -359,6 +381,35 @@ fn split<'tcx>(
     // What the cold half calls in LLVM's units must be visible to it.
     let imported: HashSet<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();
 
+    // `#[inline]` copies LLVM's units still need: what the functions and
+    // statics LLVM compiles use, and what that uses in turn. The rest were
+    // there only for functions that went to Cranelift, which has its own.
+    let mut needed: HashSet<MonoItem<'tcx>> = HashSet::new();
+    let mut stack: Vec<MonoItem<'tcx>> = Vec::new();
+    for &(item, data) in &items {
+        if data.inlined || cold.contains(&item) {
+            continue;
+        }
+        match item {
+            MonoItem::Fn(_) => stack.push(item),
+            MonoItem::Static(def_id) => {
+                if let Ok(alloc) = tcx.eval_static_initializer(def_id) {
+                    functions_in_alloc(tcx, alloc.inner(), &mut stack, &mut HashSet::new());
+                }
+            }
+            MonoItem::GlobalAsm(_) => {}
+        }
+    }
+    while let Some(item) = stack.pop() {
+        if !needed.insert(item) {
+            continue;
+        }
+        let MonoItem::Fn(instance) = item else { continue };
+        if let Ok((used, _)) = tcx.items_of_instance((instance, rustc_middle::mono::CollectionMode::UsedItems)) {
+            stack.extend(used.iter().map(|s| s.node));
+        }
+    }
+
     let mut units = Vec::with_capacity(parts.codegen_units.len());
     let mut llvm_functions = 0;
     let mut crossing = Vec::new();
@@ -370,7 +421,7 @@ fn split<'tcx>(
             unit.make_primary();
         }
         for (&item, &data) in cgu.items() {
-            if cold.contains(&item) {
+            if cold.contains(&item) || (data.inlined && !needed.contains(&item)) {
                 continue;
             }
             let mut data = data;
@@ -403,7 +454,8 @@ fn split<'tcx>(
     *CROSSING.lock().unwrap_or_else(|e| e.into_inner()) = crossing;
     if std::env::var_os("ATHRAD_TIME").is_some() {
         eprintln!(
-            "athrad: {}: LLVM gets {llvm_hot} hot functions, {llvm_held} held by the rules, {llvm_inline} #[inline] copies",
+            "athrad: {}: LLVM gets {llvm_hot} hot functions, {llvm_held} held ({failed_to_lower} not lowered, \
+             {held_hot_inline} reach hot #[inline] code, {held_sole_caller} sole callers), {llvm_inline} #[inline] copies",
             tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
         );
     }
@@ -413,4 +465,33 @@ fn split<'tcx>(
     let parts =
         MonoItemPartitions { codegen_units: tcx.arena.alloc_from_iter(units), all_mono_items: parts.all_mono_items };
     Ok((parts, cold))
+}
+
+/// The functions a static's initializer points to, through the allocations
+/// and vtables it points to.
+fn functions_in_alloc<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    alloc: &rustc_middle::mir::interpret::Allocation,
+    out: &mut Vec<MonoItem<'tcx>>,
+    seen: &mut HashSet<rustc_middle::mir::interpret::AllocId>,
+) {
+    use rustc_middle::mir::interpret::GlobalAlloc;
+    for &(_, prov) in alloc.provenance().ptrs().iter() {
+        let id = prov.alloc_id();
+        if !seen.insert(id) {
+            continue;
+        }
+        match tcx.global_alloc(id) {
+            GlobalAlloc::Function { instance } => out.push(MonoItem::Fn(instance)),
+            GlobalAlloc::Memory(inner) => functions_in_alloc(tcx, inner.inner(), out, seen),
+            GlobalAlloc::VTable(ty, dyn_ty) => {
+                let principal = dyn_ty.principal().map(|p| tcx.instantiate_bound_regions_with_erased(p));
+                let vtable = tcx.vtable_allocation((ty, principal));
+                if seen.insert(vtable) {
+                    functions_in_alloc(tcx, tcx.global_alloc(vtable).unwrap_memory().inner(), out, seen);
+                }
+            }
+            GlobalAlloc::Static(_) | GlobalAlloc::TypeId { .. } => {}
+        }
+    }
 }

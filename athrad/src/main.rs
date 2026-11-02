@@ -144,14 +144,22 @@ fn take_profile(args: &[String]) -> Result<(Option<PathBuf>, Vec<String>), Strin
 }
 
 /// How many blocks a function must have executed, over the profiled runs,
-/// to be hot. Below it, code Cranelift makes even ten times slower adds
-/// about a millisecond; a hot function sent to Cranelift instead costs the
-/// whole run several times over, so the line errs toward hot.
+/// to be hot whatever else ran. In a profile of several programs, one
+/// program's hot loop can dwarf another's: this keeps the small one's.
 const HOT_MIN: u128 = 10_000;
 
+/// The share of all executed blocks the hot functions hold at least: the
+/// hottest are taken until the rest, which Cranelift compiles, executed at
+/// most 0.0001% of the blocks. On ripgrep, 0.01% built edits in 0.48x
+/// cargo's time but ran 6% slower; this runs as fast, and builds edits in
+/// 0.71x. Work done once per run (parsing arguments,
+/// compiling a regex) is thousands of functions that each ran a little, and
+/// together they are what a short run is made of.
+const HOT_SHARE: f64 = 0.999_999;
+
 /// The hot functions of an LLVM profile, written one symbol per line into
-/// `dir`: every function that executed at least [`HOT_MIN`] blocks
-/// (`ATHRAD_HOT_MIN` overrides it).
+/// `dir`: by [`HOT_SHARE`] and [`HOT_MIN`] (`ATHRAD_HOT_SHARE` and
+/// `ATHRAD_HOT_MIN` override them).
 fn hot_list(profile: &Path, dir: &Path) -> Result<PathBuf, String> {
     // A hot list already (from `athrad hot`): use it as it is.
     if profile.extension().is_some_and(|x| x == "txt") {
@@ -186,16 +194,18 @@ fn hot_list(profile: &Path, dir: &Path) -> Result<PathBuf, String> {
         return Err(format!("llvm-profdata show failed:\n{}", String::from_utf8_lossy(&out.stderr)));
     }
     let min = std::env::var("ATHRAD_HOT_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(HOT_MIN);
-    let hot = hottest(&String::from_utf8_lossy(&out.stdout), min);
+    let share = std::env::var("ATHRAD_HOT_SHARE").ok().and_then(|s| s.parse().ok()).unwrap_or(HOT_SHARE);
+    let hot = hottest(&String::from_utf8_lossy(&out.stdout), min, share);
     let path = dir.join("athrad-hot.txt");
     std::fs::write(&path, hot.join("\n")).map_err(|e| format!("writing {}: {e}", path.display()))?;
     Ok(path)
 }
 
 /// From `llvm-profdata show --all-functions --counts`: the symbols that
-/// executed at least `min` blocks (a function's entry is one of its blocks).
+/// executed at least `min` blocks (a function's entry is one of its blocks),
+/// and the hottest others until all of them hold `share` of the blocks.
 /// A function with internal linkage is listed as `UNIT;SYMBOL`.
-fn hottest(show: &str, min: u128) -> Vec<String> {
+fn hottest(show: &str, min: u128, share: f64) -> Vec<String> {
     // A function's entry count, then its other blocks' counts; a function
     // of one block has only the entry count.
     let mut funcs: Vec<(String, u128)> = Vec::new();
@@ -216,7 +226,19 @@ fn hottest(show: &str, min: u128) -> Vec<String> {
             }
         }
     }
-    let mut hot: Vec<String> = funcs.into_iter().filter(|f| f.1 >= min).map(|f| f.0).collect();
+    funcs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let total: u128 = funcs.iter().map(|f| f.1).sum();
+    let mut held = 0u128;
+    let mut hot = Vec::new();
+    for (name, count) in funcs {
+        if count == 0 {
+            break;
+        }
+        if count >= min || (held as f64) < share * total as f64 {
+            held += count;
+            hot.push(name);
+        }
+    }
     hot.sort();
     hot.dedup();
     hot
