@@ -1052,7 +1052,34 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
 
     /// `&T` to `&[T]` or `&dyn Trait`, and the same for raw pointers and `Box`.
     fn unsize(&mut self, v: Val<'tcx>, to: TyAndLayout<'tcx>) -> Result<Val<'tcx>> {
-        let pointee = |ty: Ty<'tcx>| ty.builtin_deref(true).or_else(|| ty.boxed_ty());
+        // A smart pointer (`Arc<T>` to `Arc<dyn Trait>`, `NonNull<[T; N]>` to
+        // `NonNull<[T]>`): field by field, unsizing the one that changes, as
+        // `rustc`'s `CoerceUnsized` does.
+        if let (ty::Adt(a, _), ty::Adt(b, _)) = (v.layout.ty.kind(), to.ty.kind())
+            && a.did() == b.did()
+            && !v.layout.ty.is_box()
+        {
+            let src = self.spill(v)?;
+            let tmp = self.alloc(to, 0)?;
+            for i in 0..to.fields.count() {
+                let (sf, df) = (v.layout.field(&self.cx, i), to.field(&self.cx, i));
+                if df.is_zst() {
+                    continue;
+                }
+                let at = self.b.offset(src, off(v.layout.fields.offset(i)));
+                let field = self.read(PlaceRef { addr: at, meta: None, layout: sf })?;
+                let field = if sf.ty == df.ty { field } else { self.unsize(field, df)? };
+                let at = self.b.offset(tmp, off(to.fields.offset(i)));
+                self.write(PlaceRef { addr: at, meta: None, layout: df }, field)?;
+            }
+            return self.read(PlaceRef { addr: tmp, meta: None, layout: to });
+        }
+        // A pattern type (`*const T is !null`, inside `NonNull`) unsizes as
+        // the pointer it restricts.
+        let pointee = |ty: Ty<'tcx>| {
+            let ty = if let ty::Pat(inner, _) = ty.kind() { *inner } else { ty };
+            ty.builtin_deref(true).or_else(|| ty.boxed_ty())
+        };
         let (Some(src), Some(dst)) = (pointee(v.layout.ty), pointee(to.ty)) else {
             return Err(unsupported(format!("unsizing `{}` to `{}`", v.layout.ty, to.ty)));
         };
@@ -1091,7 +1118,37 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             return self.float_binop(op, ft, a, b, dest);
         }
         if matches!(a.layout.backend_repr, BackendRepr::ScalarPair(..)) {
-            return Err(unsupported("operators on wide pointers"));
+            // Wide pointers compare address first, then metadata.
+            let (xa, xm) = self.load_pair(a)?;
+            let (ya, ym) = self.load_pair(b)?;
+            let scalar = |v: Value| Val { v: V::Scalar(v), layout: dest };
+            let eq_a = self.b.cmp(Cmp::Eq, xa, ya);
+            let eq_m = self.b.cmp(Cmp::Eq, xm, ym);
+            let r = match op {
+                BinOp::Eq => self.b.binary(IBin::And, eq_a, eq_m),
+                BinOp::Ne => {
+                    let eq = self.b.binary(IBin::And, eq_a, eq_m);
+                    let one = self.b.iconst(Type::I8, 1);
+                    self.b.binary(IBin::Xor, eq, one)
+                }
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                    let strict = match op {
+                        BinOp::Lt | BinOp::Le => Cmp::ULt,
+                        _ => Cmp::UGt,
+                    };
+                    let on_meta = match op {
+                        BinOp::Lt => Cmp::ULt,
+                        BinOp::Le => Cmp::ULe,
+                        BinOp::Gt => Cmp::UGt,
+                        _ => Cmp::UGe,
+                    };
+                    let by_addr = self.b.cmp(strict, xa, ya);
+                    let by_meta = self.b.cmp(on_meta, xm, ym);
+                    self.b.select(eq_a, by_meta, by_addr)
+                }
+                _ => return Err(unsupported(format!("`{op:?}` on wide pointers"))),
+            };
+            return Ok(scalar(r));
         }
         let signed = matches!(ty.kind(), ty::Int(_));
         let x = self.load_scalar(a)?;
@@ -1489,6 +1546,25 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                     self.b.jump(t, &[]);
                     return Ok(());
                 }
+                // `core::arch` reaches some instructions through LLVM's own
+                // intrinsics, declared as foreign functions.
+                InstanceKind::Item(def_id) if self.tcx.is_foreign_item(def_id) => {
+                    let link = self.tcx.symbol_name(inst).name;
+                    if let Some(op) = link.strip_prefix("llvm.") {
+                        if !self.llvm_intrinsic(op, args, dest)? {
+                            return Err(unsupported(format!("the LLVM intrinsic `{link}`")));
+                        }
+                        match target {
+                            Some(t) => {
+                                let t = self.block(t);
+                                self.b.jump(t, &[]);
+                            }
+                            None => self.b.trap(),
+                        }
+                        return Ok(());
+                    }
+                    Some(inst)
+                }
                 _ => Some(inst),
             }
         } else {
@@ -1591,6 +1667,10 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.write(dest, v)?;
             }
             "assume" | "cold_path" => {}
+            "caller_location" => {
+                let loc = self.caller_location(si)?;
+                put(self, loc, false)?;
+            }
             "abort" | "unreachable" | "breakpoint" => {
                 self.b.trap();
                 return Ok(true);

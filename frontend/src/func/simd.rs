@@ -369,6 +369,112 @@ impl<'tcx> FnCx<'_, 'tcx> {
         Ok(true)
     }
 
+    /// LLVM intrinsics `core::arch` calls, by name after `llvm.`; `false`
+    /// for ones Athrad does not know.
+    pub(super) fn llvm_intrinsic(
+        &mut self,
+        name: &str,
+        args: &[rustc_span::Spanned<Operand<'tcx>>],
+        dest: PlaceRef<'tcx>,
+    ) -> Result<bool> {
+        let d = dest.addr;
+        let parts: Vec<&str> = name.split('.').collect();
+        match parts.as_slice() {
+            // Pairwise: lane i of the result combines lanes 2i and 2i+1 of
+            // `a` then of `b`.
+            ["aarch64", "neon", op @ ("umaxp" | "uminp" | "smaxp" | "sminp" | "addp"), ..] => {
+                let (a, l) = self.vector_arg(&args[0].node)?;
+                let (b, _) = self.vector_arg(&args[1].node)?;
+                let tmp = self.alloc(dest.layout, 0)?;
+                for i in 0..l.n {
+                    let (src, j) = if i < l.n / 2 { (a, 2 * i) } else { (b, 2 * (i - l.n / 2)) };
+                    let x = self.lane(src, l, j);
+                    let y = self.lane(src, l, j + 1);
+                    let r = self.neon_op(op, l, x, y)?;
+                    self.set_lane(tmp, l, i, r);
+                }
+                self.copy(d, tmp, l.n * l.size);
+            }
+            // Across all lanes, to a scalar.
+            ["aarch64", "neon", op @ ("umaxv" | "uminv" | "smaxv" | "sminv" | "uaddv" | "saddv"), ..] => {
+                let (a, l) = self.vector_arg(&args[0].node)?;
+                let op = &op[..op.len() - 1];
+                let mut acc = self.lane(a, l, 0);
+                for i in 1..l.n {
+                    let x = self.lane(a, l, i);
+                    acc = self.neon_op(if op.ends_with("add") { "addp" } else { op }, l, acc, x)?;
+                }
+                let ty = self.scalar_of(dest.layout)?;
+                let v = self.b.resize(ty, acc, op.starts_with('s'));
+                self.write(dest, Val { v: V::Scalar(v), layout: dest.layout })?;
+            }
+            // Table lookup: each index picks a byte of the table, or 0.
+            ["aarch64", "neon", "tbl1", ..] => {
+                let (t, tl) = self.vector_arg(&args[0].node)?;
+                let (idx, il) = self.vector_arg(&args[1].node)?;
+                let tmp = self.alloc(dest.layout, 0)?;
+                for i in 0..il.n {
+                    let k = self.lane(idx, il, i);
+                    let n = self.b.iconst(il.ty, tl.n.into());
+                    let inside = self.b.cmp(Cmp::ULt, k, n);
+                    let zero = self.b.iconst(il.ty, 0);
+                    let k = self.b.select(inside, k, zero);
+                    let addr = self.lane_addr(t, tl, k);
+                    let v = self.b.load(tl.ty, addr, 0);
+                    let v = self.b.select(inside, v, zero);
+                    self.set_lane(tmp, il, i, v);
+                }
+                self.copy(d, tmp, il.n * il.size);
+            }
+            // Barriers and spin-loop hints: a full fence is as strong as any.
+            ["aarch64", "isb" | "dmb" | "dsb"]
+            | ["x86", "sse2", "pause"]
+            | ["x86", "sse" | "sse2", "lfence" | "mfence" | "sfence"] => {
+                self.b.fence();
+            }
+            // The top bit of each byte, as an integer.
+            ["x86", "sse2" | "avx2", "pmovmskb", ..] => {
+                let (a, l) = self.vector_arg(&args[0].node)?;
+                let mut acc = self.b.iconst(Type::I32, 0);
+                for i in 0..l.n {
+                    let x = self.lane(a, l, i);
+                    let seven = self.b.iconst(l.ty, 7);
+                    let msb = self.b.binary(IBin::UShr, x, seven);
+                    let msb = self.b.resize(Type::I32, msb, false);
+                    let sh = self.b.iconst(Type::I32, i.into());
+                    let bit = self.b.binary(IBin::Shl, msb, sh);
+                    acc = self.b.binary(IBin::Or, acc, bit);
+                }
+                self.write(dest, Val { v: V::Scalar(acc), layout: dest.layout })?;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn neon_op(&mut self, op: &str, l: Lanes, x: Value, y: Value) -> Result<Value> {
+        Ok(match op {
+            "umaxp" | "umax" => {
+                let c = self.b.cmp(Cmp::UGt, x, y);
+                self.b.select(c, x, y)
+            }
+            "uminp" | "umin" => {
+                let c = self.b.cmp(Cmp::ULt, x, y);
+                self.b.select(c, x, y)
+            }
+            "smaxp" | "smax" => {
+                let c = self.b.cmp(Cmp::SGt, x, y);
+                self.b.select(c, x, y)
+            }
+            "sminp" | "smin" => {
+                let c = self.b.cmp(Cmp::SLt, x, y);
+                self.b.select(c, x, y)
+            }
+            "addp" => self.lane_binary("simd_add", l, x, y)?,
+            _ => return Err(unsupported(format!("the NEON operation `{op}`"))),
+        })
+    }
+
     fn lane_addr(&mut self, base: Value, l: Lanes, idx: Value) -> Value {
         let idx = self.b.resize(PTR, idx, false);
         let size = self.b.iconst(PTR, l.size.into());

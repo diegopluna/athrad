@@ -204,6 +204,16 @@ struct Ongoing {
     work_products: WorkProductMap,
 }
 
+/// A crate `rustc`'s LLVM backend compiles instead: a procedural macro,
+/// which runs only inside the compiler, never in the program.
+struct ByLlvm(Box<dyn Any>);
+
+/// Whether a crate is one the compiler loads rather than one in the
+/// program: then LLVM builds it, as `rustc` would.
+fn for_the_compiler(sess: &Session) -> bool {
+    sess.opts.crate_types.contains(&CrateType::ProcMacro)
+}
+
 impl CodegenBackend for Backend {
     fn name(&self) -> &'static str {
         "athrad"
@@ -227,6 +237,9 @@ impl CodegenBackend for Backend {
         self.llvm.target_cpu(sess)
     }
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
+        if self.rustc_links && for_the_compiler(tcx.sess) {
+            return Box::new(ByLlvm(self.llvm.codegen_crate(tcx)));
+        }
         let mut work_products = WorkProductMap::default();
         let result =
             lower_crate(tcx, &self.work_dir, &self.codegen, &mut work_products, self.rustc_links, self.std_abi);
@@ -244,6 +257,10 @@ impl CodegenBackend for Backend {
         outputs: &OutputFilenames,
         crate_info: &CrateInfo,
     ) -> (CompiledModules, WorkProductMap) {
+        let ongoing = match ongoing.downcast::<ByLlvm>() {
+            Ok(by_llvm) => return self.llvm.join_codegen(by_llvm.0, sess, outputs, crate_info),
+            Err(ongoing) => ongoing,
+        };
         let ongoing = ongoing.downcast::<Ongoing>().expect("what codegen_crate returned");
         let Ongoing { result, work_products } = *ongoing;
         if !self.rustc_links {

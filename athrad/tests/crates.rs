@@ -15,7 +15,13 @@ fn cargo_projects() {
     let crates = oracle::crates().unwrap();
     assert!(!crates.is_empty());
     for krate in crates {
-        let agreed = oracle::check_crate(&krate, athrad, work).unwrap_or_else(|e| panic!("{e:#}"));
-        eprintln!("{}: {agreed} builds agree", krate.name);
+        let may_reject = cfg!(windows)
+            && std::fs::read_to_string(krate.dir.join("Cargo.toml"))
+                .is_ok_and(|s| s.contains("athrad: may-reject-on-windows"));
+        match oracle::check_crate(&krate, athrad, work) {
+            Ok(agreed) => eprintln!("{}: {agreed} builds agree", krate.name),
+            Err(e) if may_reject && e.is::<oracle::Rejected>() => eprintln!("{}: rejected here", krate.name),
+            Err(e) => panic!("{e:#}"),
+        }
     }
 }
