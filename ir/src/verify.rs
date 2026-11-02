@@ -171,6 +171,37 @@ impl Checker<'_> {
                     self.check_target(otherwise, |v| available(v, &local))?;
                 }
                 Some(Terminator::Trap) => {}
+                Some(Terminator::TryCall { callee, args, normal, unwind, .. }) => {
+                    let sig = match callee {
+                        crate::Callee::Direct(name) => match self.symbols.get(name.as_str()) {
+                            Some(Symbol::Func(sig)) => (*sig).clone(),
+                            _ => return Err(format!("{id}: try_call of `{name}`, which is not a function")),
+                        },
+                        crate::Callee::Indirect(sig, v) => {
+                            if available(*v, &local)? != PTR {
+                                return Err(format!("{id}: try_call through a non-pointer"));
+                            }
+                            sig.clone()
+                        }
+                    };
+                    let types: Vec<Type> = args.iter().map(|&a| available(a, &local)).collect::<Result<_, _>>()?;
+                    if types != sig.param_types() {
+                        return Err(format!("{id}: try_call arguments do not match the signature"));
+                    }
+                    let params = |b: BlockId| -> Result<Vec<Type>, String> {
+                        let block = self.func.block(b).ok_or_else(|| format!("try_call to missing {b}"))?;
+                        block.params.iter().map(|&p| self.ty(p)).collect()
+                    };
+                    if params(*normal)? != sig.return_types() {
+                        return Err(format!("{id}: try_call's normal block does not take the results"));
+                    }
+                    if params(*unwind)? != [PTR] {
+                        return Err(format!("{id}: try_call's unwind block must take the exception's address"));
+                    }
+                    if normal.0 == 0 || unwind.0 == 0 {
+                        return Err("try_call to the entry block".into());
+                    }
+                }
             }
         }
         Ok(())
@@ -364,6 +395,7 @@ fn successors(term: Option<&Terminator>) -> Vec<BlockId> {
     match term {
         Some(Terminator::Jump(t)) => vec![t.block],
         Some(Terminator::Branch { then, otherwise, .. }) => vec![then.block, otherwise.block],
+        Some(Terminator::TryCall { normal, unwind, .. }) => vec![*normal, *unwind],
         _ => vec![],
     }
 }

@@ -232,6 +232,11 @@ impl std::fmt::Display for Timings {
 
 /// Run `rustc` on `source` with Athrad as its backend. `rustc`'s own
 /// messages go to stderr.
+/// Tell the frontend which code generator made the objects it keeps.
+fn set_backend_id() {
+    frontend::set_backend_id(codegen::build_id());
+}
+
 fn run_rustc(
     source: &Path,
     crate_name: &str,
@@ -249,6 +254,7 @@ fn run_rustc(
         args.push(format!("incremental={}", dir.display()));
     }
     // For looking inside: `ATHRAD_RUSTC_ARGS="-Z time-passes"`.
+    set_backend_id();
     if let Ok(extra) = std::env::var("ATHRAD_RUSTC_ARGS") {
         args.extend(extra.split_whitespace().map(str::to_owned));
     }
@@ -304,6 +310,7 @@ pub fn rustc_wrapper(args: &[String]) -> std::process::ExitCode {
             s.codegen(module, unit, &dir)
         })
     };
+    set_backend_id();
     let start = Instant::now();
     let code = frontend::run_as_rustc(&rustc_args, &work_dir, codegen_fn);
     let _ = std::fs::remove_dir_all(&work_dir);

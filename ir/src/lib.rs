@@ -409,6 +409,25 @@ pub enum Terminator {
     },
     /// Code that must never run, such as after a call that does not return.
     Trap,
+    /// A call that may unwind. On return, go to `normal`, whose parameters
+    /// are the callee's results. If the callee unwinds, go to `unwind`, whose
+    /// one parameter is the exception object's address: to clean up (run
+    /// destructors, then resume unwinding), or with `catch`, to stop the
+    /// unwinding there, as `catch_unwind` does.
+    TryCall {
+        callee: Callee,
+        args: Vec<Value>,
+        normal: BlockId,
+        unwind: BlockId,
+        catch: bool,
+    },
+}
+
+/// What a [`Terminator::TryCall`] calls.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Callee {
+    Direct(String),
+    Indirect(Signature, Value),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -751,6 +770,10 @@ impl FunctionBuilder {
         self.terminate(Terminator::Trap);
     }
 
+    pub fn try_call(&mut self, callee: Callee, args: &[Value], normal: BlockId, unwind: BlockId, catch: bool) {
+        self.terminate(Terminator::TryCall { callee, args: args.to_vec(), normal, unwind, catch });
+    }
+
     pub fn finish(self) -> Function {
         self.func
     }
@@ -932,6 +955,14 @@ impl fmt::Display for Function {
                     writeln!(f, "    branch {cond}, {then}, {otherwise}")?
                 }
                 Some(Terminator::Trap) => writeln!(f, "    trap")?,
+                Some(Terminator::TryCall { callee, args, normal, unwind, catch }) => {
+                    let c = match callee {
+                        Callee::Direct(n) => n.clone(),
+                        Callee::Indirect(sig, v) => format!("{sig} {v}"),
+                    };
+                    let kind = if *catch { "catch" } else { "unwind" };
+                    writeln!(f, "    try_call {c}({}), {normal}, {kind} {unwind}", list(args))?
+                }
             }
         }
         writeln!(f, "}}")

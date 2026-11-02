@@ -23,6 +23,16 @@ pub struct Program {
     pub path: PathBuf,
 }
 
+impl Program {
+    /// Whether Athrad may reject this program on this host: one marked
+    /// `// athrad: may-reject-on-windows`, on Windows, where Athrad has no
+    /// landing pads yet. It must still never disagree.
+    pub fn may_reject_here(&self) -> bool {
+        cfg!(windows)
+            && std::fs::read_to_string(&self.path).is_ok_and(|s| s.contains("// athrad: may-reject-on-windows"))
+    }
+}
+
 /// The programs in `oracle/programs`, sorted by name. Athrad must build
 /// each one and agree with `rustc`.
 pub fn programs() -> Result<Vec<Program>> {

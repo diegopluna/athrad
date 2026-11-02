@@ -82,6 +82,8 @@ pub(crate) fn lower<'tcx>(m: &mut ModCx<'tcx>, instance: Instance<'tcx>, linkage
         blocks: IndexVec::new(),
         locals: IndexVec::new(),
         caller_location: None,
+        pending_unwind: None,
+        exn_slot: None,
     };
     f.lower_body()?;
     let func = f.b.finish();
@@ -102,6 +104,11 @@ struct FnCx<'a, 'tcx> {
     blocks: IndexVec<BasicBlock, Option<BlockId>>,
     locals: IndexVec<Local, PlaceRef<'tcx>>,
     caller_location: Option<Value>,
+    /// What the call the current terminator makes does when the callee
+    /// unwinds; taken by the first call made.
+    pending_unwind: Option<mir::UnwindAction>,
+    /// Where a landing pad keeps the exception for `UnwindResume`.
+    exn_slot: Option<ir::Slot>,
 }
 
 impl<'a, 'tcx> FnCx<'a, 'tcx> {
@@ -131,7 +138,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             if !reachable.contains(bb) {
                 let (id, _) = self.b.block(&[]);
                 self.blocks.push(Some(id));
-            } else if data.is_cleanup {
+            } else if data.is_cleanup && !landing_pads(self.tcx) {
                 self.check_cleanup(bb)?;
                 self.blocks.push(None);
             } else {
@@ -1189,9 +1196,19 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.b.jump(t, &[]);
             }
             TerminatorKind::Return => self.ret()?,
-            TerminatorKind::Unreachable | TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(_) => {
-                self.b.trap()
+            TerminatorKind::Unreachable => self.b.trap(),
+            TerminatorKind::UnwindResume if landing_pads(self.tcx) => {
+                let slot = self.exn_slot();
+                let a = self.b.slot_addr(slot);
+                let exn = self.b.load(PTR, a, 0);
+                self.m.use_func("_Unwind_Resume", ir::Signature::new([PTR], []));
+                self.b.call("_Unwind_Resume", &[exn], &[]);
+                self.b.trap();
             }
+            TerminatorKind::UnwindTerminate(reason) if landing_pads(self.tcx) => {
+                self.terminate(*reason)?;
+            }
+            TerminatorKind::UnwindResume | TerminatorKind::UnwindTerminate(_) => self.b.trap(),
             TerminatorKind::SwitchInt { discr, targets } => {
                 let d = self.operand(discr)?;
                 let d = self.load_scalar(d)?;
@@ -1207,7 +1224,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let other = self.block(targets.otherwise());
                 self.b.jump(other, &[]);
             }
-            TerminatorKind::Assert { cond, expected, msg, target, .. } => {
+            TerminatorKind::Assert { cond, expected, msg, target, unwind } => {
+                self.pending_unwind = Some(*unwind);
                 let ok = self.block(*target);
                 if !self.tcx.sess.overflow_checks() && msg.is_optional_overflow_check() {
                     self.b.jump(ok, &[]);
@@ -1224,11 +1242,13 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.b.switch_to(fail);
                 self.assert_failure(si, msg)?;
             }
-            TerminatorKind::Call { func, args, destination, target, fn_span, .. } => {
+            TerminatorKind::Call { func, args, destination, target, fn_span, unwind, .. } => {
+                self.pending_unwind = Some(*unwind);
                 let si = SourceInfo { span: *fn_span, ..si };
                 self.call(si, func, args, *destination, *target)?;
             }
-            TerminatorKind::Drop { place, target, .. } => {
+            TerminatorKind::Drop { place, target, unwind, .. } => {
+                self.pending_unwind = Some(*unwind);
                 let p = self.place(*place)?;
                 self.drop(p, *target)?;
             }
@@ -1239,7 +1259,78 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             | TerminatorKind::FalseEdge { .. }
             | TerminatorKind::FalseUnwind { .. } => return Err(unsupported("coroutines")),
         }
+        self.pending_unwind = None;
         Ok(())
+    }
+
+    fn exn_slot(&mut self) -> ir::Slot {
+        match self.exn_slot {
+            Some(s) => s,
+            None => {
+                let s = self.b.slot(8, 8);
+                self.exn_slot = Some(s);
+                s
+            }
+        }
+    }
+
+    /// Abort, as unwinding out of where it may not (a function that cannot
+    /// unwind, or a destructor during unwinding) does: `core`'s nounwind
+    /// panic for the reason.
+    fn terminate(&mut self, reason: mir::UnwindTerminateReason) -> Result<()> {
+        let item = match reason {
+            mir::UnwindTerminateReason::Abi => LangItem::PanicCannotUnwind,
+            mir::UnwindTerminateReason::InCleanup => LangItem::PanicInCleanup,
+        };
+        let def_id = self.tcx.require_lang_item(item, rustc_span::DUMMY_SP);
+        let inst = Instance::mono(self.tcx, def_id);
+        let abi = self.cx.fn_abi_of_instance(inst, ty::List::empty());
+        let (name, _) = self.m.func_symbol(inst)?;
+        self.pending_unwind = None;
+        self.emit_call(Callee::Direct(name), abi, Vec::new(), None)?;
+        if !self.b.is_terminated() {
+            self.b.trap();
+        }
+        Ok(())
+    }
+
+    /// Call, with a landing pad when the current terminator's unwind action
+    /// asks for one: to its cleanup block, or to abort. Returns the results.
+    fn call_unwinding(&mut self, callee: ir::Callee, sig: ir::Signature, args: &[Value]) -> Result<Vec<Value>> {
+        let action = self.pending_unwind.take();
+        let pad = match action {
+            Some(a @ (mir::UnwindAction::Cleanup(_) | mir::UnwindAction::Terminate(_))) if landing_pads(self.tcx) => a,
+            _ => {
+                return Ok(match callee {
+                    ir::Callee::Direct(name) => {
+                        let rets = sig.return_types();
+                        self.m.use_func(&name, sig);
+                        self.b.call(&name, args, &rets)
+                    }
+                    ir::Callee::Indirect(sig, ptr) => self.b.call_indirect(sig, ptr, args),
+                });
+            }
+        };
+        if let ir::Callee::Direct(name) = &callee {
+            self.m.use_func(name, sig.clone());
+        }
+        let (normal, results) = self.b.block(&sig.return_types());
+        let (unwind, exn) = self.b.block(&[PTR]);
+        self.b.try_call(callee, args, normal, unwind, false);
+        self.b.switch_to(unwind);
+        match pad {
+            mir::UnwindAction::Cleanup(bb) => {
+                let slot = self.exn_slot();
+                let a = self.b.slot_addr(slot);
+                self.b.store(a, 0, exn[0]);
+                let t = self.block(bb);
+                self.b.jump(t, &[]);
+            }
+            mir::UnwindAction::Terminate(reason) => self.terminate(reason)?,
+            _ => unreachable!("matched above"),
+        }
+        self.b.switch_to(normal);
+        Ok(results)
     }
 
     fn ret(&mut self) -> Result<()> {
@@ -1294,8 +1385,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         let inst = Instance::mono(self.tcx, def_id);
         let name = self.tcx.symbol_name(inst).name.to_owned();
         let params: Vec<Type> = args.iter().map(|&a| self.b.value_type(a)).collect();
-        self.m.use_func(&name, ir::Signature::new(params, []));
-        self.b.call(&name, &args, &[]);
+        self.call_unwinding(ir::Callee::Direct(name), ir::Signature::new(params, []), &args)?;
         self.b.trap();
         Ok(())
     }
@@ -1318,7 +1408,8 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             let (call, _) = self.b.block(&[]);
             self.b.branch(has_glue, (call, &[]), (t, &[]));
             self.b.switch_to(call);
-            self.b.call_indirect(ir::Signature::new([PTR], []), glue, &[p.addr]);
+            let sig = ir::Signature::new([PTR], []);
+            self.call_unwinding(ir::Callee::Indirect(sig.clone(), glue), sig, &[p.addr])?;
             self.b.jump(t, &[]);
             return Ok(());
         }
@@ -1664,7 +1755,30 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 let d = self.discriminant(PlaceRef { addr, meta: None, layout }, dest.layout)?;
                 put(self, d, false)?;
             }
-            "catch_unwind" => return Err(unsupported("catching panics")),
+            "catch_unwind" if !landing_pads(tcx) => return Err(unsupported("catching panics on this target")),
+            "catch_unwind" => {
+                // `try_fn(data)`; if it unwinds, `catch_fn(data, exception)`.
+                let mut v = Vec::new();
+                for a in &args[..3] {
+                    let x = self.operand(&a.node)?;
+                    v.push(self.load_scalar(x)?);
+                }
+                let (try_fn, data, catch_fn) = (v[0], v[1], v[2]);
+                let (normal, _) = self.b.block(&[]);
+                let (caught, exn) = self.b.block(&[PTR]);
+                let (join, r) = self.b.block(&[Type::I32]);
+                let sig = ir::Signature::new([PTR], []);
+                self.b.try_call(ir::Callee::Indirect(sig, try_fn), &[data], normal, caught, true);
+                self.b.switch_to(normal);
+                let zero = self.b.iconst(Type::I32, 0);
+                self.b.jump(join, &[zero]);
+                self.b.switch_to(caught);
+                self.b.call_indirect(ir::Signature::new([PTR, PTR], []), catch_fn, &[data, exn[0]]);
+                let one = self.b.iconst(Type::I32, 1);
+                self.b.jump(join, &[one]);
+                self.b.switch_to(join);
+                put(self, r[0], false)?;
+            }
             _ if name.starts_with("simd_") => {
                 if !self.simd_intrinsic(name, inst, args, dest)? {
                     return Err(unsupported(format!("the `{name}` intrinsic")));
@@ -1951,15 +2065,12 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
             }
         }
 
-        let results = match callee {
-            Callee::Direct(name) => {
-                self.m.use_func(&name, sig.clone());
-                let rets = sig.return_types();
-                self.b.call(&name, &call_args, &rets)
-            }
-            Callee::Indirect(ptr) => self.b.call_indirect(sig, ptr, &call_args),
-            Callee::Virtual(_) => self.b.call_indirect(sig, fn_ptr.expect("a receiver"), &call_args),
+        let ir_callee = match callee {
+            Callee::Direct(name) => ir::Callee::Direct(name),
+            Callee::Indirect(ptr) => ir::Callee::Indirect(sig.clone(), ptr),
+            Callee::Virtual(_) => ir::Callee::Indirect(sig.clone(), fn_ptr.expect("a receiver")),
         };
+        let results = self.call_unwinding(ir_callee, sig, &call_args)?;
 
         let ret_layout = abi.ret.layout;
         let ret = match &abi.ret.mode {
@@ -1988,6 +2099,14 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
         Ok(())
     }
+}
+
+/// Whether Athrad runs cleanups and catches panics on this target: with
+/// DWARF unwinding (ELF and Mach-O). On Windows, where unwinding is SEH with
+/// funclets Cranelift cannot express, cleanups are skipped where that
+/// cannot be seen and programs are rejected otherwise (`unwind.rs`).
+pub(crate) fn landing_pads(tcx: TyCtxt<'_>) -> bool {
+    !tcx.sess.target.is_like_windows
 }
 
 /// The float format of a type, if it is `f32` or `f64`.

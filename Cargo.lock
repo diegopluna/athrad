@@ -101,6 +101,7 @@ dependencies = [
  "postcard",
  "serde",
  "sha2",
+ "target-lexicon",
 ]
 
 [[package]]

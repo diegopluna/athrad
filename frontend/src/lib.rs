@@ -33,7 +33,7 @@ mod unwind;
 
 use std::any::Any;
 use std::fmt::Display;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use std::path::{Path, PathBuf};
 
@@ -324,9 +324,24 @@ fn upstream_facts(tcx: TyCtxt<'_>) -> Result<Vec<unwind::Facts>, String> {
     Ok(all)
 }
 
-/// The keys of Athrad's files in a codegen unit's work product.
-const WP_OBJECT: &str = "athrad-o";
-const WP_FACTS: &str = "athrad-facts";
+/// The keys of Athrad's files in a codegen unit's work product. They name
+/// the code generator that made the object ([`set_backend_id`]): `rustc`
+/// knows when a unit's MIR changed, not when Athrad did.
+fn wp_keys() -> (&'static str, &'static str) {
+    static KEYS: OnceLock<(&'static str, &'static str)> = OnceLock::new();
+    *KEYS.get_or_init(|| {
+        let id = BACKEND_ID.get().map(String::as_str).unwrap_or("unknown");
+        (format!("athrad-o-{id}").leak(), format!("athrad-facts-{id}").leak())
+    })
+}
+
+static BACKEND_ID: OnceLock<String> = OnceLock::new();
+
+/// Name the code generator in use, so units it did not compile are not
+/// reused (call once, before compiling).
+pub fn set_backend_id(id: &str) {
+    let _ = BACKEND_ID.set(id.to_owned());
+}
 
 fn lower_crate(
     tcx: TyCtxt<'_>,
@@ -366,12 +381,12 @@ fn lower_crate(
         let previous = incremental
             .then(|| tcx.dep_graph.previous_work_product(&cgu.work_product_id()))
             .flatten()
-            .filter(|wp| wp.saved_files.contains_key(WP_OBJECT) && wp.saved_files.contains_key(WP_FACTS));
+            .filter(|wp| wp.saved_files.contains_key(wp_keys().0) && wp.saved_files.contains_key(wp_keys().1));
         if let Some(wp) = previous
             && determine_cgu_reuse(tcx, cgu) != CguReuse::No
         {
             let id = cgu.work_product_id();
-            let (o, f) = (&wp.saved_files[WP_OBJECT], &wp.saved_files[WP_FACTS]);
+            let (o, f) = (&wp.saved_files[wp_keys().0], &wp.saved_files[wp_keys().1]);
             // The session directory is renamed when rustc finishes; link
             // the files from where they are now, or copy them.
             let obj_path = work_dir.join(format!("{name}.{}", link::ObjectFormat::host().extension()));
@@ -408,7 +423,7 @@ fn lower_crate(
         let obj_path = codegen(&module, &name)?;
         std::fs::write(&facts_path, postcard::to_allocvec(&facts)?)?;
         if incremental {
-            let files = [(WP_OBJECT, obj_path.as_path()), (WP_FACTS, facts_path.as_path())];
+            let files = [(wp_keys().0, obj_path.as_path()), (wp_keys().1, facts_path.as_path())];
             let (id, wp) = rustc_incremental::copy_cgu_workproduct_to_incr_comp_cache_dir(sess, &name, &files, &[]);
             work_products.insert(id, wp);
         }

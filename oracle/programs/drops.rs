@@ -1,3 +1,4 @@
+// athrad: may-reject-on-windows (no landing pads there yet)
 struct Noisy(&'static str);
 
 impl Drop for Noisy {

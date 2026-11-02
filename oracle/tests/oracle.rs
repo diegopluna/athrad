@@ -33,8 +33,10 @@ fn overflow_panics() {
 fn every_program() {
     let mut failures = Vec::new();
     for program in oracle::programs().unwrap() {
-        if let Err(e) = oracle::check(&program, &work_dir().join("all")) {
-            failures.push(format!("{e:#}"));
+        match oracle::check(&program, &work_dir().join("all")) {
+            Err(e) if e.is::<oracle::Rejected>() && program.may_reject_here() => {}
+            Err(e) => failures.push(format!("{e:#}")),
+            Ok(_) => {}
         }
     }
     assert!(failures.is_empty(), "{} failed:\n\n{}", failures.len(), failures.join("\n\n"));
@@ -91,6 +93,7 @@ fn every_program_with_athrads_frontend() {
         match oracle::check_subset(&program, work_dir()) {
             Ok((_, true)) => {}
             Ok((_, false)) => fell_back.push(program.name.clone()),
+            Err(e) if e.is::<oracle::Rejected>() && program.may_reject_here() => {}
             Err(e) => failures.push(format!("{e:#}")),
         }
     }

@@ -25,6 +25,11 @@ mod unwind;
 
 pub use cache::{Cache, Stats};
 
+/// Identifies this build of the code generator: a hash of its sources.
+pub fn build_id() -> &'static str {
+    env!("ATHRAD_CODEGEN_BUILD_ID")
+}
+
 /// Compile `module` for the host into an object named `name`.
 pub fn compile(module: &ir::Module, name: &str) -> Result<object::write::Object<'static>> {
     Ok(compile_cached(module, name, &mut Cache::in_memory())?.0)
@@ -182,7 +187,12 @@ pub fn compile_cached(
             .map_err(|e| anyhow!("{e:?}"))
             .with_context(|| format!("defining fn {}", func.name))?;
         if let Some(info) = entry.unwind {
-            unwind_entries.push(unwind::Entry { func: id, info, size: entry.code.len() as u32 });
+            unwind_entries.push(unwind::Entry {
+                func: id,
+                info,
+                size: entry.code.len() as u32,
+                call_sites: entry.call_sites.clone(),
+            });
         }
     }
 
@@ -218,8 +228,42 @@ fn compile_one(
         };
         relocs.push(cache::CachedReloc { offset: m.offset, kind: m.kind, target, addend: m.addend });
     }
-    Ok(cache::Entry { align, code: code.buffer.data().to_vec(), relocs, unwind })
+    let mut call_sites = Vec::new();
+    for site in code.buffer.call_sites() {
+        let mut pad = None;
+        for h in site.exception_handlers {
+            if let cranelift_codegen::MachExceptionHandler::Tag(tag, at) = h {
+                pad = Some((cranelift_codegen::entity::EntityRef::index(*tag) as u32 == TAG_CATCH, at.as_offset()));
+            }
+        }
+        call_sites.push(cache::CallSite { ret_addr: site.ret_addr, pad });
+    }
+    // Only a function with a landing pad needs its call sites listed.
+    if call_sites.iter().all(|c| c.pad.is_none()) {
+        call_sites.clear();
+    }
+    Ok(cache::Entry { align, code: code.buffer.data().to_vec(), relocs, unwind, call_sites })
 }
+
+/// A function's reference in the function being built, declared once.
+fn func_ref_for<'a>(
+    obj: &mut ObjectModule,
+    b: &mut FunctionBuilder,
+    funcs: &mut HashMap<&'a str, clif::FuncRef>,
+    ids: &HashMap<&'a str, Id>,
+    name: &str,
+) -> clif::FuncRef {
+    let (key, id) = ids.get_key_value(name).expect("verified IR");
+    *funcs.entry(*key).or_insert_with(|| {
+        let Id::Func(id) = *id else { unreachable!("verified IR: `{name}` is a function") };
+        obj.declare_func_in_func(id, b.func)
+    })
+}
+
+/// Exception tags of `try_call` handlers: to clean up and resume, or to
+/// catch (stop the unwinding).
+const TAG_CLEANUP: u32 = 0;
+const TAG_CATCH: u32 = 1;
 
 #[derive(Clone, Copy)]
 enum Id {
@@ -639,6 +683,50 @@ fn lower(
             ir::Terminator::Trap => {
                 b.ins().trap(TrapCode::user(1).expect("1 is a user trap code"));
             }
+            ir::Terminator::TryCall { callee, args, normal, unwind, catch } => {
+                let (sig, target) = match callee {
+                    ir::Callee::Direct(name) => (sigs[name.as_str()].clone(), None),
+                    ir::Callee::Indirect(sig, ptr) => (sig.clone(), Some(get(&values, *ptr))),
+                };
+                let call_args: Vec<clif::Value> = args.iter().map(|&a| get(&values, a)).collect();
+                let call_args = abi_values(&mut b, &sig.params, &call_args, true);
+                let sig_ref = b.import_signature(signature(obj, &sig));
+                // Returns arrive as the calling convention passes them; a
+                // block of our own turns floats back into integers.
+                let ret_block = b.create_block();
+                let ret_types: Vec<clif::Type> = sig.returns.iter().map(param_type).collect();
+                let ret_args: Vec<BlockArg> = (0..ret_types.len()).map(|i| BlockArg::TryCallRet(i as u32)).collect();
+                let normal_call = b.func.dfg.block_call(ret_block, &ret_args);
+                let pad = b.create_block();
+                let pad_call = b.func.dfg.block_call(pad, &[BlockArg::TryCallExn(0)]);
+                let tag =
+                    cranelift_codegen::ir::ExceptionTag::with_number(if *catch { TAG_CATCH } else { TAG_CLEANUP })
+                        .expect("a small tag");
+                let table = b.func.dfg.exception_tables.push(cranelift_codegen::ir::ExceptionTableData::new(
+                    sig_ref,
+                    normal_call,
+                    [cranelift_codegen::ir::ExceptionTableItem::Tag(tag, pad_call)],
+                ));
+                match (callee, target) {
+                    (ir::Callee::Direct(name), _) => {
+                        let f = func_ref_for(obj, &mut b, &mut funcs, ids, name);
+                        b.ins().try_call(f, &call_args, table);
+                    }
+                    (_, Some(ptr)) => {
+                        b.ins().try_call_indirect(ptr, &call_args, table);
+                    }
+                    _ => unreachable!("an indirect callee has an address"),
+                }
+                b.switch_to_block(ret_block);
+                let rets: Vec<clif::Value> = ret_types.iter().map(|&t| b.append_block_param(ret_block, t)).collect();
+                let rets = abi_values(&mut b, &sig.returns, &rets, false);
+                let rets: Vec<BlockArg> = rets.into_iter().map(BlockArg::Value).collect();
+                b.ins().jump(blocks[normal.0 as usize], &rets);
+                b.switch_to_block(pad);
+                b.set_cold_block(pad);
+                let exn = b.append_block_param(pad, types::I64);
+                b.ins().jump(blocks[unwind.0 as usize], &[BlockArg::Value(exn)]);
+            }
         }
     }
 
@@ -852,6 +940,7 @@ fn reverse_postorder(func: &ir::Function) -> Vec<usize> {
             Some(ir::Terminator::Branch { then, otherwise, .. }) => {
                 vec![then.block.0 as usize, otherwise.block.0 as usize]
             }
+            Some(ir::Terminator::TryCall { normal, unwind, .. }) => vec![normal.0 as usize, unwind.0 as usize],
             _ => vec![],
         }
     };

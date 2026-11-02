@@ -43,6 +43,16 @@ pub(crate) struct Entry {
     pub code: Vec<u8>,
     pub relocs: Vec<CachedReloc>,
     pub unwind: Option<UnwindInfo>,
+    /// Every call's return address and the landing pads for it, when the
+    /// function has any: what its LSDA lists for the personality routine.
+    pub call_sites: Vec<CallSite>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct CallSite {
+    pub ret_addr: u32,
+    /// `(catch, landing pad offset)`; at most one.
+    pub pad: Option<(bool, u32)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
