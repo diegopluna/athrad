@@ -107,6 +107,7 @@ pub(crate) fn partition<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'
     let default = DEFAULT_PARTITION.get().expect("the default partition is saved before it is replaced");
     let parts = default(tcx, ());
     let Some(tier) = TIER.get() else { return parts };
+    let _timer = tcx.prof.generic_activity("athrad_tier_split");
     match split(tcx, &parts, tier) {
         Ok((parts, cold)) => {
             *COLD.lock().unwrap_or_else(|e| e.into_inner()) = Some(Ok(cold));
@@ -132,6 +133,7 @@ fn lower_one<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>, linkage: ir::Lin
 }
 
 fn lower_all<'tcx>(tcx: TyCtxt<'tcx>, work: Vec<(MonoItem<'tcx>, ir::Linkage)>) -> Vec<(MonoItem<'tcx>, Lowered)> {
+    let _timer = tcx.prof.generic_activity("athrad_lower_to_ir");
     rustc_data_structures::sync::par_map(work, |(item, linkage)| {
         let MonoItem::Fn(instance) = item else { return (item, None) };
         (item, lower_one(tcx, instance, linkage))
@@ -460,7 +462,11 @@ fn split<'tcx>(
         );
     }
     let codegen = tier.codegen.clone();
-    let object = std::thread::spawn(move || codegen(&module, "athrad-cold").map_err(|e| format!("{e:#}")));
+    let prof = tcx.prof.clone();
+    let object = std::thread::spawn(move || {
+        let _timer = prof.generic_activity("athrad_cranelift_codegen");
+        codegen(&module, "athrad-cold").map_err(|e| format!("{e:#}"))
+    });
     let cold = Cold { object, facts: unwind::Facts::merged(&facts), functions, llvm_functions };
     let parts =
         MonoItemPartitions { codegen_units: tcx.arena.alloc_from_iter(units), all_mono_items: parts.all_mono_items };
