@@ -305,3 +305,17 @@ The goal changed: a release binary that runs as fast as `cargo build --release`'
 | `codegen-units=256` | 1.00x | 0.89x | 0.99x / 1.04x |
 
 The same cargo build took 5.8 s on one sandbox and 10.2 s on the other, so compare only within a run, and treat effects under about 10% as unresolved at 3 rounds. No `rustc` setting gives a large cut without slowing some binary: LLVM's optimizer is most of a release build, and it is the part that makes the code fast.
+
+### Tiered release builds
+
+`athrad build --release --profile HOT.txt` gives LLVM only what a run profile found hot, and Cranelift the rest. The profile comes from `athrad build --release --profile-generate DIR` (LLVM's instrumentation, with its pre-inliner off: otherwise small functions inlined before they are counted look cold, and the binaries ran 13x slower), running the programs, and `athrad hot DIR -o HOT.txt` (functions that executed at least 10,000 blocks; `ATHRAD_HOT_MIN`). `frontend/src/tier.rs` replaces `rustc`'s partitioning query. A function stays with LLVM if it is hot, if Athrad cannot lower it, if it reaches a hot `#[inline]` function through copies (a function run once can hold the hot loop: `Map::fold`), or if it is the only caller of a function in LLVM's half (LLVM inlines those, and `spec_extend` inlining `extend_trusted` was worth 18% on `sha`). Symbols that cross get hidden external linkage and are added to `exported_non_generic_symbols`, or LLVM's ThinLTO internalizes and drops them.
+
+Results on `bench/release`, every output identical to cargo's:
+
+| | macOS arm64 (12 cores) | Linux x86_64 (boat.dev, 4 vCPU) |
+|---|---|---|
+| clean build | 0.88x | 0.95x |
+| one-file edit (`json`) | 1.34x, then about 1.0x after the no-op overhead fix | 1.12x |
+| run time, geomean / worst | 0.999x / 1.04x | 1.02x / 1.13x (regex) |
+
+Why the build barely moves: in a release build LLVM is about a third of a crate's time (`regex_automata`: 0.57 s of 1.68 s), and of what LLVM still gets after the split, nearly all is `#[inline]` copies the hot code needs (`regex_automata`: 31 hot functions, 386 held by the rules, 3,922 copies). Pruning copies only cold code used saved 3% and broke a link through a static. The edited crate of each workload is the workload, and all of it is hot: `json`'s LLVM time is the same either way. Per crate, the parallel frontend helps more than the split (`regex_automata` 1.68 s to 1.12 s), but cargo already builds crates in parallel. A program with much more cold code than hot (an application rather than a benchmark) is where the split should pay; these workloads cannot show it.

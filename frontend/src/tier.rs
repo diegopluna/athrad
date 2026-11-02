@@ -362,6 +362,7 @@ fn split<'tcx>(
     let mut units = Vec::with_capacity(parts.codegen_units.len());
     let mut llvm_functions = 0;
     let mut crossing = Vec::new();
+    let (mut llvm_inline, mut llvm_hot, mut llvm_held) = (0usize, 0usize, 0usize);
     let mut seen_crossing = HashSet::new();
     for cgu in parts.codegen_units {
         let mut unit = CodegenUnit::new(cgu.name());
@@ -384,6 +385,15 @@ fn split<'tcx>(
                 }
             }
             llvm_functions += usize::from(matches!(item, MonoItem::Fn(_)));
+            if matches!(item, MonoItem::Fn(_)) {
+                if data.inlined {
+                    llvm_inline += 1;
+                } else if tier.hot.contains(name) {
+                    llvm_hot += 1;
+                } else {
+                    llvm_held += 1;
+                }
+            }
             unit.items_mut().insert(item, data);
         }
         unit.compute_size_estimate();
@@ -391,6 +401,12 @@ fn split<'tcx>(
     }
 
     *CROSSING.lock().unwrap_or_else(|e| e.into_inner()) = crossing;
+    if std::env::var_os("ATHRAD_TIME").is_some() {
+        eprintln!(
+            "athrad: {}: LLVM gets {llvm_hot} hot functions, {llvm_held} held by the rules, {llvm_inline} #[inline] copies",
+            tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE)
+        );
+    }
     let codegen = tier.codegen.clone();
     let object = std::thread::spawn(move || codegen(&module, "athrad-cold").map_err(|e| format!("{e:#}")));
     let cold = Cold { object, facts: unwind::Facts::merged(&facts), functions, llvm_functions };
