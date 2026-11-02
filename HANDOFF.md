@@ -96,7 +96,7 @@ Three interfaces exist from the first week, even when each has one implementatio
 
 ## State of this directory
 
-Milestones 0 through 3 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
+Milestones 0 through 4 are done on all three hosts: CI is green on Ubuntu (x86_64), macOS (aarch64), and Windows (x86_64, MSVC), and Linux aarch64 passes in Docker. The repository is public at https://github.com/diegopluna/athrad, so Actions minutes are free.
 
 `athrad FILE.rs [-o OUT]` builds a one-file binary crate as `rustc --edition 2024 FILE.rs` would, and the oracle checks 17 programs that way: arithmetic and overflow panics, loops and recursion, structs, enums and `match`, `Option`/`Result`, `Vec`, `String`, `Box`, sorting, iterators and closures, generics, trait objects, `f32`/`f64` with their edge cases, `i128`/`u128`, bounds-check and `unwrap`/`expect`/`panic!` panics, `ExitCode`, a generated 1,800-line program, and a series of edits.
 
@@ -181,4 +181,29 @@ The oracle builds each project in `oracle/crates` with `cargo build` and with `a
 
 On a small project Athrad and `rustc` now cost the same, because both spend the time in the same places: Cargo, `rustc`'s frontend, and `rustc`'s link, which here is 45 ms of each edit. Athrad's own work is a few milliseconds. The one-file commands still link themselves and run `ld` without the C driver (11 ms less on macOS). Under Cargo, the way to do the same is to give `rustc` Athrad as its `-C linker`, running the command the driver would run; that, or `lld`, is the next lever.
 
-Next is milestone 4: a frontend of Athrad's own, for the subset the pipeline already runs.
+### Milestone 4: a frontend of Athrad's own
+
+Done, and green on all three hosts. The `subset` crate is a lexer, a parser, a type checker, and a lowering to Athrad IR, for one-file programs over integers and `bool`: `fn` items, `let` and `let mut`, arithmetic with the overflow and division checks of a debug build, comparisons, `if`, `while`, `loop`, `for` over integer ranges, `break`, `continue`, `return`, calls, `T::MAX`/`MIN`/`BITS`, `as` between integers, `std::hint::black_box`, and `print!`, `println!`, `eprint!`, `eprintln!` with `{}`, `{:?}`, `{0}`, and `{name}`. `athrad FILE.rs` and `athrad watch` try it first; Cargo builds do not use it.
+
+**The rule, kept by falling back.** A program `subset` is not sure of goes to `rustc`, which compiles it or reports the error; `subset` never writes a diagnostic. It falls back on any syntax it does not know, and on everything in its subset that `rustc` rejects:
+
+* type errors, unknown names, assigning to a binding that is not `mut`, wrong argument counts, unused format arguments;
+* `overflowing_literals`, including `rustc`'s typing of a literal by the type it is cast to;
+* `arithmetic_overflow` and `unconditional_panic`, the deny-by-default lints `rustc` fires when constant propagation shows an operation will panic. `subset` propagates constants at least as far as `rustc` does, through every local and into both arms of every `if`, so it rejects at least what `rustc` rejects. When in doubt it falls back.
+
+`subset/src/lib.rs` has tests of programs that must fall back. Columns in panic locations are `rustc`'s display columns, so a file with tabs or non-ASCII text also falls back.
+
+**`std` without `rustc`.** The programs `subset` compiles link with a runtime: a small Rust program (`athrad::runtime::SOURCE`) that Athrad builds once with `rustc` as the frontend, kept in `.athrad/runtime/` with a stamp of the Athrad that built it. It provides the C `main`, `lang_start`, and the allocator shim; its `main` calls `athrad_user_main`, which `subset`'s object defines. It also provides `print!` helpers, so output goes through `std`'s own stdout and stderr. Building it also reads what `subset` needs to know about the pinned `std` from `rustc` (`frontend::StdAbi`): the symbols of `core`'s panic functions, and the layout of `core::panic::Location`. So an overflow panic calls the same `core` function `rustc`'s code calls, with the same location.
+
+**The oracle.** Every program is built a second time with `subset` allowed, and `subset_*.rs` (control flow, 128-bit values, casts, printing, and a program for each of the ten panics), `add.rs`, `print_edges.rs`, and `overflow.rs` must not fall back. The first run caught a real difference: `rustc` builds `-170141183460469231731687303715884105728i128` as a constant, while `subset` negated at run time and panicked.
+
+**The number.** `scripts/edit_loop.py`, same method as before:
+
+| Program | `cargo build` | `athrad` | `athrad watch` |
+|---|---|---|---|
+| `add.rs` | 135 ms | 60 ms | 46 ms |
+| `subset_flow.rs` | 148 ms | 60 ms | 47 ms |
+
+`subset` parses, checks, and lowers either file in about 0.1 ms. What is left is the link (about 30–40 ms on macOS) and, for the command, starting the process.
+
+The subset is deliberately small: the programs it covers are ones a dev loop rarely needs. Growing it means taking on `std`'s generic code (`Vec`, `String`, iterators, traits), which needs `std`'s MIR. That means `rustc`'s metadata, and with it most of `rustc`. The measurements say where the time is now, for programs `subset` does not cover: `rustc`'s frontend (40–90 ms) and the link (30–45 ms). The next levers are the linker (the C driver under Cargo, then `lld`) and, for multi-crate builds, starting dependents on early metadata as Headstart does.
