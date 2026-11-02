@@ -13,6 +13,10 @@ fn main() {
     let out = std::process::Command::new(rustc).args(["--print", "sysroot"]).output().expect("running rustc");
     let sysroot = String::from_utf8(out.stdout).expect("utf-8 sysroot");
     let target = std::env::var("TARGET").unwrap_or_default();
+    // Where `athrad` finds the toolchain's `llvm-profdata`, with no `rustc`
+    // to ask at run time.
+    println!("cargo:rustc-env=ATHRAD_SYSROOT={}", sysroot.trim());
+    println!("cargo:rustc-env=ATHRAD_HOST={target}");
     if !target.contains("windows") {
         println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{}/lib", sysroot.trim());
     }

@@ -36,7 +36,26 @@ VARIANTS = {
     "opt2": {"CARGO_PROFILE_RELEASE_OPT_LEVEL": "2"},
     "share-generics": {"RUSTFLAGS": "-Zshare-generics=yes"},
     "cgu256": {"CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "256"},
+    # `athrad build --release --profile`: LLVM for what the profile found
+    # hot, Cranelift for the rest. Needs target/release/athrad.
+    "athrad-tiered": {},
 }
+
+ATHRAD = ROOT / "target" / "release" / "athrad"
+PROFILE = BENCH / "target" / "athrad-hot.txt"
+
+
+def make_profile():
+    """Collect the profile `athrad-tiered` builds with, outside any timing:
+    an instrumented build, every workload run once, the counts merged."""
+    raw = BENCH / "target" / "athrad-profraw"
+    shutil.rmtree(raw, ignore_errors=True)
+    env = env_for("cargo")
+    env["CARGO_TARGET_DIR"] = str(BENCH / "target" / "athrad-profile")
+    subprocess.run([ATHRAD, "build", "--release", "-q", "--profile-generate", raw], cwd=BENCH, env=env, check=True)
+    for w in WORKLOADS:
+        subprocess.run([BENCH / "target" / "athrad-profile" / "release" / w], check=True, capture_output=True)
+    subprocess.run([ATHRAD, "hot", raw, "-o", PROFILE], check=True)
 
 
 def env_for(name):
@@ -49,8 +68,12 @@ def env_for(name):
 
 
 def cargo_build(name):
+    if name == "athrad-tiered":
+        cmd = [ATHRAD, "build", "--release", "-q", "--profile", PROFILE]
+    else:
+        cmd = ["cargo", "build", "--release", "-q"]
     t = time.perf_counter()
-    subprocess.run(["cargo", "build", "--release", "-q"], cwd=BENCH, env=env_for(name), check=True)
+    subprocess.run(cmd, cwd=BENCH, env=env_for(name), check=True)
     return time.perf_counter() - t
 
 
@@ -76,6 +99,8 @@ def main():
 
     # Fetch once, outside any timing.
     subprocess.run(["cargo", "fetch", "-q"], cwd=BENCH, check=True)
+    if "athrad-tiered" in names:
+        make_profile()
     clean = {n: [] for n in names}
     edit = {n: [] for n in names}
     original = EDIT.read_text()

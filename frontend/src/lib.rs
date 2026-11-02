@@ -29,6 +29,7 @@ mod consts;
 mod cx;
 mod func;
 mod stdabi;
+mod tier;
 mod unwind;
 
 use std::any::Any;
@@ -132,6 +133,17 @@ pub fn run_as_rustc(args: &[String], work_dir: &Path, codegen: Codegen) -> std::
         eprintln!("error: creating {}: {e}", work_dir.display());
         return std::process::ExitCode::FAILURE;
     }
+    if let Some(path) = std::env::var_os("ATHRAD_HOT") {
+        match tier::load_hot(Path::new(&path)) {
+            Ok(hot) => {
+                let _ = tier::TIER.set(tier::Tier { hot, codegen: codegen.clone() });
+            }
+            Err(e) => {
+                eprintln!("error: reading the hot functions in {}: {e}", Path::new(&path).display());
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+    }
     let mut cb = Callbacks { slot: Slot::default(), codegen, rustc_links: true, std_abi: false };
     rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(args, &mut cb))
 }
@@ -152,7 +164,11 @@ impl rustc_driver::Callbacks for Callbacks {
         // build's units are kept, and they cost a link each.
         config.opts.incremental = None;
         config.opts.cg.incremental = None;
-        config.opts.cli_forced_codegen_units = Some(1);
+        // A tiered release build keeps LLVM's units as `rustc` makes them.
+        let tiered = self.rustc_links && tier::TIER.get().is_some();
+        if !tiered {
+            config.opts.cli_forced_codegen_units = Some(1);
+        }
         // `rustc`'s own queries run on every core. 0 would mean the same;
         // a number past the jobserver's tokens waits, it does not oversubscribe.
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(32);
@@ -196,6 +212,10 @@ struct Ongoing {
 /// which runs only inside the compiler, never in the program.
 struct ByLlvm(Box<dyn Any>);
 
+/// A release build split by a profile: LLVM's half, and Athrad's in
+/// [`tier::COLD`].
+struct Tiered(Box<dyn Any>);
+
 /// Whether a crate is one the compiler loads rather than one in the
 /// program: then LLVM builds it, as `rustc` would.
 fn for_the_compiler(sess: &Session) -> bool {
@@ -219,7 +239,13 @@ impl CodegenBackend for Backend {
         self.llvm.target_config(sess)
     }
     fn provide(&self, providers: &mut Providers) {
-        self.llvm.provide(providers)
+        self.llvm.provide(providers);
+        if self.rustc_links && tier::TIER.get().is_some() {
+            let _ = tier::DEFAULT_PARTITION.set(providers.queries.collect_and_partition_mono_items);
+            providers.queries.collect_and_partition_mono_items = tier::partition;
+            let _ = tier::DEFAULT_EXPORTED.set(providers.queries.exported_non_generic_symbols);
+            providers.queries.exported_non_generic_symbols = tier::exported;
+        }
     }
     fn target_cpu(&self, sess: &Session) -> String {
         self.llvm.target_cpu(sess)
@@ -227,6 +253,10 @@ impl CodegenBackend for Backend {
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
         if self.rustc_links && for_the_compiler(tcx.sess) {
             return Box::new(ByLlvm(self.llvm.codegen_crate(tcx)));
+        }
+        if self.rustc_links && tier::TIER.get().is_some() {
+            // LLVM asks for the partition, which splits off the cold half.
+            return Box::new(Tiered(self.llvm.codegen_crate(tcx)));
         }
         let work_products = WorkProductMap::default();
         let result = lower_crate(tcx, &self.codegen, self.rustc_links, self.std_abi);
@@ -246,6 +276,10 @@ impl CodegenBackend for Backend {
     ) -> (CompiledModules, WorkProductMap) {
         let ongoing = match ongoing.downcast::<ByLlvm>() {
             Ok(by_llvm) => return self.llvm.join_codegen(by_llvm.0, sess, outputs, crate_info),
+            Err(ongoing) => ongoing,
+        };
+        let ongoing = match ongoing.downcast::<Tiered>() {
+            Ok(tiered) => return self.join_tiered(tiered.0, sess, outputs, crate_info),
             Err(ongoing) => ongoing,
         };
         let ongoing = ongoing.downcast::<Ongoing>().expect("what codegen_crate returned");
@@ -291,6 +325,53 @@ impl CodegenBackend for Backend {
             self.llvm.link(sess, modules, info, metadata, outputs);
         }
         // Otherwise the caller of `compile` links, after rustc is done.
+    }
+}
+
+impl Backend {
+    fn join_tiered(
+        &self,
+        llvm: Box<dyn Any>,
+        sess: &Session,
+        outputs: &OutputFilenames,
+        crate_info: &CrateInfo,
+    ) -> (CompiledModules, WorkProductMap) {
+        let (mut modules, work_products) = self.llvm.join_codegen(llvm, sess, outputs, crate_info);
+        let cold = tier::COLD.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let cold = match cold {
+            Some(Ok(cold)) => cold,
+            Some(Err(e)) => sess.dcx().fatal(format!("Athrad's half of a tiered build: {e}")),
+            None => sess.dcx().fatal("Athrad's half of a tiered build never started"),
+        };
+        let object = match cold.object.join() {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => sess.dcx().fatal(format!("Athrad's half of a tiered build: {e}")),
+            Err(_) => sess.dcx().fatal("Athrad's half of a tiered build panicked"),
+        };
+        if std::env::var_os("ATHRAD_TIME").is_some() {
+            eprintln!(
+                "athrad: {}: {} functions to LLVM, {} to Cranelift",
+                crate_info.local_crate_name, cold.llvm_functions, cold.functions
+            );
+        }
+        if let Ok(bytes) = postcard::to_allocvec(&cold.facts) {
+            for &t in &sess.opts.crate_types {
+                let path = rustc_session::output::out_filename(sess, t, outputs, crate_info.local_crate_name);
+                let _ = std::fs::write(facts_path_for(path.as_path()), &bytes);
+            }
+        }
+        modules.modules.push(CompiledModule {
+            name: "athrad-cold".into(),
+            kind: ModuleKind::Regular,
+            object: Some(object),
+            global_asm_object: None,
+            dwarf_object: None,
+            bytecode: None,
+            assembly: None,
+            llvm_ir: None,
+            links_from_incr_cache: Vec::new(),
+        });
+        (modules, work_products)
     }
 }
 
@@ -579,7 +660,7 @@ fn split_chunks<T>(mut items: Vec<T>, threads: usize) -> Vec<Vec<T>> {
 /// One module from pieces lowered apart. A symbol defined in any piece is
 /// not imported from another. Constants lowered twice have the same name and
 /// the same bytes.
-fn merge_modules(parts: Vec<ir::Module>) -> Result<ir::Module> {
+pub(crate) fn merge_modules(parts: Vec<ir::Module>) -> Result<ir::Module> {
     // Names defined by any piece. Imports of those are dropped.
     let mut defined = std::collections::HashSet::new();
     for part in &parts {
