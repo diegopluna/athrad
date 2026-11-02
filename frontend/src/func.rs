@@ -1253,7 +1253,7 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
                 self.drop(p, *target)?;
             }
             TerminatorKind::TailCall { .. } => return Err(unsupported("tail calls")),
-            TerminatorKind::InlineAsm { .. } => return Err(unsupported("inline assembly")),
+            TerminatorKind::InlineAsm { template, operands, .. } => self.inline_asm(template, operands)?,
             TerminatorKind::Yield { .. }
             | TerminatorKind::CoroutineDrop
             | TerminatorKind::FalseEdge { .. }
@@ -1261,6 +1261,42 @@ impl<'a, 'tcx> FnCx<'a, 'tcx> {
         }
         self.pending_unwind = None;
         Ok(())
+    }
+
+    /// Inline assembly Athrad knows: only `int $0x29` with the code in `ecx`,
+    /// Windows' `__fastfail`, which `std::process::abort` uses there. It
+    /// becomes a call to two bytes of machine code that never return.
+    fn inline_asm(
+        &mut self,
+        template: &[rustc_ast::InlineAsmTemplatePiece],
+        operands: &[mir::InlineAsmOperand<'tcx>],
+    ) -> Result<()> {
+        let text: String = template.iter().map(|p| p.to_string()).collect();
+        let target = &self.tcx.sess.target;
+        let windows_x64 = target.is_like_windows && target.arch == rustc_target::spec::Arch::X86_64;
+        if windows_x64
+            && text.replace('$', "").trim() == "int 0x29"
+            && let [mir::InlineAsmOperand::In { reg, value }] = operands
+            && format!("{reg}").contains("cx")
+        {
+            let v = self.operand(value)?;
+            let code = self.load_scalar(v)?;
+            let code = self.b.resize(Type::I32, code, false);
+            let name = "__athrad_fastfail";
+            if !self.m.module.raw.iter().any(|f| f.name == name) {
+                // `int 0x29` (the code is already in ecx, the first
+                // argument's register), then `ud2`.
+                self.m.module.raw.push(ir::RawFunction {
+                    name: name.into(),
+                    sig: ir::Signature::new([Type::I32], []),
+                    bytes: vec![0xcd, 0x29, 0x0f, 0x0b],
+                });
+            }
+            self.b.call(name, &[code], &[]);
+            self.b.trap();
+            return Ok(());
+        }
+        Err(unsupported(format!("inline assembly (`{text}`)")))
     }
 
     fn exn_slot(&mut self) -> ir::Slot {

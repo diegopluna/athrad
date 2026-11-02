@@ -67,6 +67,12 @@ pub fn compile_cached(
         let sig = signature(&obj, &func.sig);
         ids.insert(&func.name, Id::Func(obj.declare_function(&func.name, linkage(func.linkage), &sig)?));
     }
+    for f in &module.raw {
+        let sig = signature(&obj, &f.sig);
+        let id = obj.declare_function(&f.name, Linkage::Local, &sig)?;
+        obj.define_function_bytes(id, 16, &f.bytes, &[]).map_err(|e| anyhow!("{e:?}"))?;
+        ids.insert(&f.name, Id::Func(id));
+    }
     for d in &module.data {
         ids.insert(&d.name, Id::Data(obj.declare_data(&d.name, linkage(d.linkage), d.writable, d.tls)?));
     }
@@ -102,6 +108,9 @@ pub fn compile_cached(
     }
     for func in &module.functions {
         sigs.insert(&func.name, &func.sig);
+    }
+    for f in &module.raw {
+        sigs.insert(&f.name, &f.sig);
     }
 
     let imported: HashSet<&str> = module.imports.iter().map(|i| i.name.as_str()).collect();

@@ -48,6 +48,7 @@ impl<'a> Verifier<'a> {
             .iter()
             .map(|e| &e.name)
             .chain(module.functions.iter().map(|f| &f.name))
+            .chain(module.raw.iter().map(|f| &f.name))
             .chain(module.data.iter().map(|d| &d.name));
         for name in all {
             if name.is_empty() {

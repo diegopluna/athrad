@@ -460,11 +460,21 @@ impl Function {
     }
 }
 
+/// A function given as machine code: for the few instructions Rust's `std`
+/// writes in inline assembly that Athrad knows the bytes of.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RawFunction {
+    pub name: String,
+    pub sig: Signature,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Module {
     pub imports: Vec<Import>,
     pub functions: Vec<Function>,
     pub data: Vec<Data>,
+    pub raw: Vec<RawFunction>,
 }
 
 /// What a name in a module refers to.
@@ -515,6 +525,9 @@ impl Module {
     /// What `name` is, if this module defines or imports it.
     pub fn symbol(&self, name: &str) -> Option<Symbol<'_>> {
         if let Some(f) = self.function(name) {
+            return Some(Symbol::Func(&f.sig));
+        }
+        if let Some(f) = self.raw.iter().find(|f| f.name == name) {
             return Some(Symbol::Func(&f.sig));
         }
         if let Some(d) = self.data.iter().find(|d| d.name == name) {

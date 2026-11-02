@@ -46,6 +46,9 @@ pub fn later_programs() -> Result<Vec<Program>> {
 }
 
 fn programs_in(dir: &Path) -> Result<Vec<Program>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
     let mut programs = Vec::new();
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let path = entry?.path();
