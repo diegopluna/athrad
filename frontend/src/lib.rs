@@ -28,6 +28,7 @@ extern crate rustc_target;
 mod consts;
 mod cx;
 mod func;
+mod stdabi;
 mod unwind;
 
 use std::any::Any;
@@ -59,6 +60,7 @@ use rustc_span::DUMMY_SP;
 use rustc_symbol_mangling::mangle_internal_symbol;
 
 use crate::consts::ModCx;
+pub use crate::stdabi::{LocationLayout, StdAbi};
 
 pub type Result<T, E = anyhow::Error> = std::result::Result<T, E>;
 
@@ -91,6 +93,9 @@ pub struct Output {
     /// objects were reused, out of all of them.
     pub reused: usize,
     pub units: usize,
+    /// What Athrad's own frontend needs to know about `std`, when asked
+    /// for: see [`StdAbi`].
+    pub std_abi: Option<StdAbi>,
 }
 
 /// Compile a binary crate. `args` is a `rustc` command line, program name
@@ -110,9 +115,14 @@ pub struct Output {
 /// product, as LLVM's is under `rustc`, and `rustc` decides when it is still
 /// good.
 pub fn compile(args: &[String], work_dir: &Path, codegen: Codegen) -> Result<Output> {
+    compile_with(args, work_dir, codegen, false)
+}
+
+/// [`compile`], and with `std_abi`, read [`StdAbi`] too.
+pub fn compile_with(args: &[String], work_dir: &Path, codegen: Codegen, std_abi: bool) -> Result<Output> {
     std::fs::create_dir_all(work_dir).with_context(|| format!("creating {}", work_dir.display()))?;
     let slot = Slot::default();
-    let mut cb = Callbacks { slot: slot.clone(), work_dir: work_dir.to_owned(), codegen, rustc_links: false };
+    let mut cb = Callbacks { slot: slot.clone(), work_dir: work_dir.to_owned(), codegen, rustc_links: false, std_abi };
     let ran = rustc_driver::catch_fatal_errors(|| rustc_driver::run_compiler(args, &mut cb));
     let result = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     match (ran, result) {
@@ -132,7 +142,8 @@ pub fn run_as_rustc(args: &[String], work_dir: &Path, codegen: Codegen) -> std::
         eprintln!("error: creating {}: {e}", work_dir.display());
         return std::process::ExitCode::FAILURE;
     }
-    let mut cb = Callbacks { slot: Slot::default(), work_dir: work_dir.to_owned(), codegen, rustc_links: true };
+    let mut cb =
+        Callbacks { slot: Slot::default(), work_dir: work_dir.to_owned(), codegen, rustc_links: true, std_abi: false };
     rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(args, &mut cb))
 }
 
@@ -143,6 +154,7 @@ struct Callbacks {
     work_dir: PathBuf,
     codegen: Codegen,
     rustc_links: bool,
+    std_abi: bool,
 }
 
 impl rustc_driver::Callbacks for Callbacks {
@@ -166,11 +178,11 @@ impl rustc_driver::Callbacks for Callbacks {
         let slot = self.slot.clone();
         let work_dir = self.work_dir.clone();
         let codegen = self.codegen.clone();
-        let rustc_links = self.rustc_links;
+        let (rustc_links, std_abi) = (self.rustc_links, self.std_abi);
         config.make_codegen_backend = Some(Box::new(move |sess| {
             let early = rustc_session::EarlyDiagCtxt::new(sess.opts.error_format);
             let llvm = rustc_interface::util::get_codegen_backend(&early, &sess.opts.sysroot, None, &sess.target);
-            Box::new(Backend { llvm, slot, work_dir, codegen, rustc_links })
+            Box::new(Backend { llvm, slot, work_dir, codegen, rustc_links, std_abi })
         }));
     }
 }
@@ -183,6 +195,7 @@ struct Backend {
     /// `rustc` links the result (Athrad is driven by Cargo), rather than the
     /// caller of [`compile`].
     rustc_links: bool,
+    std_abi: bool,
 }
 
 /// What `codegen_crate` hands `join_codegen`.
@@ -215,7 +228,8 @@ impl CodegenBackend for Backend {
     }
     fn codegen_crate<'tcx>(&self, tcx: TyCtxt<'tcx>) -> Box<dyn Any> {
         let mut work_products = WorkProductMap::default();
-        let result = lower_crate(tcx, &self.work_dir, &self.codegen, &mut work_products, self.rustc_links);
+        let result =
+            lower_crate(tcx, &self.work_dir, &self.codegen, &mut work_products, self.rustc_links, self.std_abi);
         if self.rustc_links
             && let Err(e) = &result
         {
@@ -320,6 +334,7 @@ fn lower_crate(
     codegen: &Codegen,
     work_products: &mut WorkProductMap,
     rustc_links: bool,
+    want_std_abi: bool,
 ) -> Result<Output> {
     if tcx.data_layout.pointer_size().bytes() != 8 || tcx.data_layout.endian != rustc_abi::Endian::Little {
         return Err(unsupported("targets that are not 64-bit little-endian"));
@@ -417,6 +432,7 @@ fn lower_crate(
     let allocator = if shim.functions.is_empty() { None } else { Some(codegen(&shim, "athrad-allocator-shim")?) };
 
     let link = if rustc_links { None } else { Some(link_inputs(tcx)?) };
+    let std_abi = if want_std_abi { Some(stdabi::std_abi(tcx)?) } else { None };
     Ok(Output {
         objects,
         allocator,
@@ -425,6 +441,7 @@ fn lower_crate(
         lower_time,
         reused,
         units: parts.codegen_units.len(),
+        std_abi,
     })
 }
 

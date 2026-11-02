@@ -91,7 +91,7 @@ pub fn executable_name(stem: &str) -> String {
 }
 
 /// Everything an executable is linked from.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Inputs {
     /// Object files, linked whole.
     pub objects: Vec<PathBuf>,
@@ -102,7 +102,7 @@ pub struct Inputs {
     pub libs: Vec<NativeLib>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NativeLib {
     pub name: String,
     pub kind: LibKind,
@@ -110,7 +110,7 @@ pub struct NativeLib {
     pub verbatim: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum LibKind {
     Dylib,
     Static,

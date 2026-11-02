@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["ir", "frontend", "codegen", "link", "oracle", "athrad"]
+members = ["ir", "subset", "frontend", "codegen", "link", "oracle", "athrad"]
 exclude = ["oracle/crates"]
 
 [workspace.package]
@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 ir = { path = "ir" }
 frontend = { path = "frontend" }
+subset = { path = "subset" }
 codegen = { path = "codegen" }
 link = { path = "link" }
 athrad = { path = "athrad" }

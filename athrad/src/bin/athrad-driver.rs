@@ -77,13 +77,15 @@ fn main() -> ExitCode {
 
 /// What is kept between runs, next to the output in `.athrad/`: each
 /// function's machine code in `STEM.cache`, and `rustc`'s incremental
-/// state, with each codegen unit's object, in `STEM.incr/`.
+/// state, with each codegen unit's object, in `STEM.incr/`; and the runtime
+/// of Athrad's own frontend, in `runtime/`.
 fn caches(args: &Args) -> Result<athrad::Caches> {
     let dir = args.output.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let dir = dir.join(".athrad");
     Ok(athrad::Caches {
         code: codegen::Cache::load(&dir.join(format!("{}.cache", args.stem)))?,
         incremental: Some(dir.join(format!("{}.incr", args.stem))),
+        runtime: Some(dir.join("runtime")),
     })
 }
 

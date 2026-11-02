@@ -81,6 +81,25 @@ fn later_programs_never_disagree() {
     assert!(disagreements.is_empty(), "{}", disagreements.join("\n\n"));
 }
 
+/// Every program again, with Athrad's own frontend allowed to take it. The
+/// ones it is meant to cover must not fall back to rustc.
+#[test]
+fn every_program_with_athrads_frontend() {
+    let mut failures = Vec::new();
+    let mut fell_back = Vec::new();
+    for program in oracle::programs().unwrap() {
+        match oracle::check_subset(&program, work_dir()) {
+            Ok((_, true)) => {}
+            Ok((_, false)) => fell_back.push(program.name.clone()),
+            Err(e) => failures.push(format!("{e:#}")),
+        }
+    }
+    assert!(failures.is_empty(), "{} failed:\n\n{}", failures.len(), failures.join("\n\n"));
+    let covered = |n: &str| n.starts_with("subset_") || ["add", "print_edges", "overflow"].contains(&n);
+    let missed: Vec<&String> = fell_back.iter().filter(|n| covered(n)).collect();
+    assert!(missed.is_empty(), "these went to rustc: {missed:?}");
+}
+
 /// The oracle must notice when Athrad is wrong: rustc builds `add` (prints
 /// 5), Athrad builds a program that prints 6.
 #[test]

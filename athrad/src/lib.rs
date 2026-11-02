@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use link::{Linker, ObjectFormat};
 
+pub mod runtime;
 pub mod watch;
 
 /// What a build may reuse from earlier builds.
@@ -35,6 +36,9 @@ pub struct Caches {
     pub code: codegen::Cache,
     /// `rustc`'s incremental directory, if incremental compilation is on.
     pub incremental: Option<PathBuf>,
+    /// Where the runtime of Athrad's own frontend is kept. With one, a
+    /// program in the subset `subset` covers skips `rustc` altogether.
+    pub runtime: Option<PathBuf>,
 }
 
 /// Build the binary crate rooted at `source` into the executable `output`
@@ -62,6 +66,14 @@ pub fn build_cached(
     let _ = std::fs::remove_dir_all(work_dir);
     std::fs::create_dir_all(work_dir).with_context(|| format!("creating {}", work_dir.display()))?;
 
+    let mut fallback = None;
+    if let Some(dir) = caches.runtime.clone() {
+        match build_subset(source, linker, &mut caches.code, &dir, work_dir, output)? {
+            Ok(t) => return Ok(t),
+            Err(why) => fallback = Some(why),
+        }
+    }
+
     let state = Arc::new(Mutex::new(CodegenState { cache: std::mem::take(&mut caches.code), ..Default::default() }));
     let codegen_fn: frontend::Codegen = {
         let state = state.clone();
@@ -81,6 +93,7 @@ pub fn build_cached(
     let out = result?;
 
     let mut t = Timings {
+        fallback,
         lower: out.lower_time,
         codegen: state.codegen_time,
         cache: state.stats,
@@ -119,9 +132,50 @@ impl CodegenState {
     }
 }
 
+/// Build `source` with Athrad's own frontend, if it is in the subset that
+/// covers: `Ok(Err(why))` when it is not, and `rustc` should build it.
+fn build_subset(
+    source: &Path,
+    linker: &dyn Linker,
+    code: &mut codegen::Cache,
+    runtime_dir: &Path,
+    work_dir: &Path,
+    output: &Path,
+) -> Result<std::result::Result<Timings, String>> {
+    let start = Instant::now();
+    let text = std::fs::read_to_string(source).with_context(|| format!("reading {}", source.display()))?;
+    let rt = match runtime::ensure(runtime_dir) {
+        Ok(rt) => rt,
+        Err(e) => return Ok(Err(format!("its runtime could not be built: {e:#}"))),
+    };
+    let rt_time = start.elapsed();
+    let start = Instant::now();
+    let module = match subset::compile(&text, &source.to_string_lossy(), &rt.subset_abi()) {
+        Ok(m) => m,
+        Err(f) => return Ok(Err(f.to_string())),
+    };
+    let mut t = Timings { subset: true, rustc: rt_time, lower: start.elapsed(), ..Timings::default() };
+    let mut state = CodegenState { cache: std::mem::take(code), ..Default::default() };
+    let obj = state.codegen(&module, "subset", work_dir);
+    *code = state.cache;
+    let obj = obj?;
+    t.codegen = state.codegen_time;
+    t.cache = state.stats;
+    let mut inputs = rt.link.clone();
+    inputs.objects = rt.objects.iter().cloned().chain([obj]).collect();
+    let start = Instant::now();
+    linker.link(&inputs, output)?;
+    t.link = start.elapsed();
+    Ok(Ok(t))
+}
+
 /// Where a build's time went.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Timings {
+    /// Athrad's own frontend built the program, without `rustc`.
+    pub subset: bool,
+    /// Why Athrad's own frontend handed the program to `rustc`, if it did.
+    pub fallback: Option<String>,
     /// `rustc`: parsing through partitioning, and its incremental bookkeeping.
     pub rustc: Duration,
     /// MIR to IR.
@@ -145,6 +199,21 @@ impl Timings {
 impl std::fmt::Display for Timings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        if self.subset {
+            return write!(
+                f,
+                "Athrad's frontend {:.1} ms, codegen {:.1} ms ({} functions cached, {} compiled), link {:.1} ms, total {:.1} ms",
+                ms(self.lower),
+                ms(self.codegen),
+                self.cache.hits,
+                self.cache.misses,
+                ms(self.link),
+                ms(self.total())
+            );
+        }
+        if let Some(why) = &self.fallback {
+            write!(f, "rustc, since {why}; ")?;
+        }
         write!(
             f,
             "rustc {:.1} ms, lower {:.1} ms ({} of {} units reused), codegen {:.1} ms ({} functions cached, {} compiled), link {:.1} ms, total {:.1} ms",
@@ -170,9 +239,6 @@ fn run_rustc(
     work_dir: &Path,
     codegen: frontend::Codegen,
 ) -> Result<frontend::Output> {
-    // rustc's driver keeps global state; run one compilation at a time.
-    static RUSTC: Mutex<()> = Mutex::new(());
-    let _one = RUSTC.lock().unwrap_or_else(|e| e.into_inner());
     let mut args: Vec<String> =
         ["athrad", "--edition", "2024", "--crate-type", "bin", "--crate-name", crate_name, &source.to_string_lossy()]
             .iter()
@@ -186,7 +252,15 @@ fn run_rustc(
     if let Ok(extra) = std::env::var("ATHRAD_RUSTC_ARGS") {
         args.extend(extra.split_whitespace().map(str::to_owned));
     }
-    frontend::compile(&args, work_dir, codegen)
+    with_rustc(|| frontend::compile(&args, work_dir, codegen))
+}
+
+/// Run `f`, which runs `rustc`, alone: `rustc`'s driver keeps global
+/// state, so one compilation at a time per process.
+pub(crate) fn with_rustc<T>(f: impl FnOnce() -> T) -> T {
+    static RUSTC: Mutex<()> = Mutex::new(());
+    let _one = RUSTC.lock().unwrap_or_else(|e| e.into_inner());
+    f()
 }
 
 /// Be `rustc` for Cargo, which runs `RUSTC_WRAPPER RUSTC ARGS...`: compile

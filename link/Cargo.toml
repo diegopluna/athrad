@@ -11,6 +11,7 @@ publish.workspace = true
 anyhow.workspace = true
 cc.workspace = true
 object.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

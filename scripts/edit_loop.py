@@ -38,6 +38,7 @@ RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 10
 # (program, literal to flip, what to flip it to). Each literal is in `main`.
 PROGRAMS = [
     ("add.rs", "add(2, 3)", "add(2, 4)"),
+    ("subset_flow.rs", "sum_to(100)", "sum_to(101)"),
     ("heap.rs", "0..10", "0..11"),
     ("traits.rs", "twice(|x| x * k, 2)", "twice(|x| x * k, 3)"),
     ("big.rs", "let (t, s) = work3(8);", "let (t, s) = work3(9);"),
@@ -77,7 +78,7 @@ def output(exe):
 def main():
     if not ATHRAD.exists():
         sys.exit("build athrad first: cargo build --release -p athrad")
-    print(f"{'program':10} {'cargo build':>12} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)")
+    print(f"{'program':15} {'cargo build':>12} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)")
     for name, a, b in PROGRAMS:
         src = ROOT / "oracle" / "programs" / name
         with tempfile.TemporaryDirectory() as tmp:
@@ -130,7 +131,7 @@ def main():
                 w.kill()
 
             med = lambda xs: statistics.median(xs)
-            print(f"{name:10} {med(cargo_ms):12.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}")
+            print(f"{name:15} {med(cargo_ms):12.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}")
 
 
 # Cargo projects: (name, files to copy in, file to edit, literal, flip).

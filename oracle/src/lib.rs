@@ -102,6 +102,30 @@ pub fn check(program: &Program, work_dir: &Path) -> Result<Agreement> {
     check_sources(&program.name, &program.path, &program.path, work_dir)
 }
 
+/// Like [`check`], with Athrad's own frontend allowed to build the program
+/// (it falls back to `rustc` for anything outside its subset). Returns
+/// whether it did, with the agreement. The runtime it links with is built
+/// once in `work_dir/runtime`.
+pub fn check_subset(program: &Program, work_dir: &Path) -> Result<(Agreement, bool)> {
+    let name = &program.name;
+    let dir = work_dir.join("subset").join(name);
+    std::fs::create_dir_all(dir.join("src"))?;
+    let src = dir.join("src").join(format!("{name}.rs"));
+    std::fs::copy(&program.path, &src)?;
+    let rustc_exe = build_with_rustc(name, &src, &dir.join("rustc"))?;
+    let exe = dir.join("athrad").join(link::executable_name(name));
+    std::fs::create_dir_all(dir.join("athrad"))?;
+    let mut caches = athrad::Caches { runtime: Some(work_dir.join("runtime")), ..Default::default() };
+    let t = athrad::build_cached(&src, linker()?, &mut caches, &dir.join("work"), &exe)
+        .map_err(|e| Rejected(format!("{e:#}")))?;
+    let (rustc, athrad) = (run(&rustc_exe)?, run(&exe)?);
+    if rustc != athrad {
+        let how = if t.subset { "Athrad's own frontend" } else { "Athrad" };
+        bail!("`{name}`: {how} disagrees with rustc\nrustc:\n{rustc}\nathrad:\n{athrad}");
+    }
+    Ok((Agreement { rustc, athrad }, t.subset))
+}
+
 /// Like [`check`], with a different source for each compiler: how the
 /// oracle's own test makes Athrad wrong on purpose.
 pub fn check_sources(name: &str, rustc_src: &Path, athrad_src: &Path, work_dir: &Path) -> Result<Agreement> {
@@ -164,7 +188,7 @@ pub fn check_edits(program: &Program, work_dir: &Path) -> Result<Reuse> {
     std::fs::create_dir_all(dir.join("src"))?;
     let src = dir.join("src").join(format!("{name}.rs"));
     let mut lines: Vec<String> = std::fs::read_to_string(&program.path)?.lines().map(str::to_owned).collect();
-    let mut caches = athrad::Caches { code: Default::default(), incremental: Some(dir.join("incr")) };
+    let mut caches = athrad::Caches { code: Default::default(), incremental: Some(dir.join("incr")), runtime: None };
     let mut reuse = Reuse::default();
     for step in 0..=edits.len() {
         if step > 0 {
