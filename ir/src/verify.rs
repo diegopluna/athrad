@@ -75,6 +75,9 @@ impl<'a> Verifier<'a> {
         for f in &module.functions {
             symbols.insert(&f.name, Symbol::Func(&f.sig));
         }
+        for f in &module.raw {
+            symbols.insert(&f.name, Symbol::Func(&f.sig));
+        }
         for d in &module.data {
             if !d.align.is_power_of_two() {
                 return Err(module_err(format!("data `{}` has alignment {}", d.name, d.align)));
@@ -566,6 +569,18 @@ mod tests {
         let mut m = Module::new();
         m.push(b.finish());
         assert!(verify(&m).unwrap_err().message.contains("address"));
+    }
+
+    #[test]
+    fn accepts_calls_to_raw_functions() {
+        let mut m = Module::new();
+        m.raw.push(RawFunction { name: "raw".into(), sig: Signature::new([Type::I32], []), bytes: vec![0xcc] });
+        let mut b = FunctionBuilder::new("f", Linkage::Local, Signature::default());
+        let x = b.iconst(Type::I32, 7);
+        b.call("raw", &[x], &[]);
+        b.ret(&[]);
+        m.push(b.finish());
+        verify(&m).unwrap();
     }
 
     #[test]
