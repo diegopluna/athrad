@@ -426,11 +426,35 @@ impl<'tcx> FnCx<'_, 'tcx> {
                 }
                 self.copy(d, tmp, il.n * il.size);
             }
+            // Clearing the upper halves of AVX registers: nothing to do when
+            // vectors live in memory.
+            ["x86", "avx", "vzeroupper" | "vzeroall"] => {}
             // Barriers and spin-loop hints: a full fence is as strong as any.
             ["aarch64", "isb" | "dmb" | "dsb"]
             | ["x86", "sse2", "pause"]
             | ["x86", "sse" | "sse2", "lfence" | "mfence" | "sfence"] => {
                 self.b.fence();
+            }
+            // Byte shuffle within each 16-byte lane: an index with its top bit
+            // set gives 0, else the byte its low four bits name.
+            ["x86", "ssse3" | "avx2" | "avx512", "pshuf", "b", ..] => {
+                let (a, l) = self.vector_arg(&args[0].node)?;
+                let (idx, _) = self.vector_arg(&args[1].node)?;
+                let tmp = self.alloc(dest.layout, 0)?;
+                for i in 0..l.n {
+                    let k = self.lane(idx, l, i);
+                    let mask = self.b.iconst(Type::I8, 0x0f);
+                    let low = self.b.binary(IBin::And, k, mask);
+                    let base = self.b.iconst(Type::I8, ((i / 16) * 16) as i128);
+                    let at = self.b.add(low, base);
+                    let addr = self.lane_addr(a, l, at);
+                    let v = self.b.load(Type::I8, addr, 0);
+                    let zero = self.b.iconst(Type::I8, 0);
+                    let neg = self.b.cmp(Cmp::SLt, k, zero);
+                    let v = self.b.select(neg, zero, v);
+                    self.set_lane(tmp, l, i, v);
+                }
+                self.copy(d, tmp, l.n * l.size);
             }
             // The top bit of each byte, as an integer.
             ["x86", "sse2" | "avx2", "pmovmskb", ..] => {
