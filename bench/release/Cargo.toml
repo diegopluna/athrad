@@ -1,0 +1,15 @@
+# Run-time workloads for comparing release builds. Every binary prints a
+# checksum, so a build that changes behaviour is caught, and runs for a
+# fraction of a second under `cargo build --release`.
+# Driven by scripts/release_bench.py.
+[workspace]
+resolver = "3"
+members = ["regex", "json", "hashmap", "sort", "deflate", "sha", "numeric", "nbody", "btree", "strings"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+rng = { path = "rng" }

@@ -1,0 +1,8 @@
+[package]
+name = "hashmap"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rng.workspace = true
