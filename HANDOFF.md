@@ -219,24 +219,28 @@ Still rejected everywhere: inline assembly (except Windows `std`'s `__fastfail`)
 
 ### After coverage: the edit loop
 
-Re-measured after landing pads and the rest of that work. `scripts/edit_loop.py`, median of 10, same machine and method as the tables above. One literal flipped back and forth, both caches warm. One-file builds were run afterwards and matched `cargo build`'s binary every time. `popular` is `oracle/crates/popular`, one binary crate on 24 crates.io libraries.
+Re-measured after landing pads and the rest of that work, and again with `cargo build --release` in the same run. `scripts/edit_loop.py`, median of 10, same machine and method as the tables above. One literal flipped back and forth, caches warm. One-file debug builds were run afterwards and matched `cargo build`'s binary every time. `popular` is `oracle/crates/popular`, one binary crate on 24 crates.io libraries.
 
-| Program | `cargo build` | `athrad` | `athrad watch` |
+`cargo build --release` is opt-level 3 and does not pass `-C incremental`, so an edit recompiles the whole crate it touched. Dependencies are already built. Athrad still compiles like a debug build, overflow checks included. The release column is rebuild time. The release binary is optimized.
+
+| Program | `cargo build` | `cargo build --release` | `athrad` | `athrad watch` |
+|---|---|---|---|---|
+| `add.rs` | 138 ms | 124 ms | 58 ms | 46 ms |
+| `subset_flow.rs` | 151 ms | 144 ms | 59 ms | 48 ms |
+| `heap.rs` | 184 ms | 223 ms | 111 ms | 103 ms |
+| `traits.rs` | 161 ms | 152 ms | 101 ms | 93 ms |
+| `big.rs` | 268 ms | 1,683 ms | 182 ms | 168 ms |
+
+| Project | `cargo build` | `cargo build --release` | `athrad build` |
 |---|---|---|---|
-| `add.rs` | 138 ms | 59 ms | 48 ms |
-| `subset_flow.rs` | 152 ms | 60 ms | 48 ms |
-| `heap.rs` | 187 ms | 113 ms | 103 ms |
-| `traits.rs` | 159 ms | 102 ms | 94 ms |
-| `big.rs` | 263 ms | 181 ms | 168 ms |
+| `shapes`, edit in the binary crate | 165 ms | 189 ms | 173 ms |
+| `shapes`, edit in the library | 225 ms | 245 ms | 217 ms |
+| `big.rs` as a package | 278 ms | 1,710 ms | 240 ms |
+| `popular`, edit in the binary | 428 ms | 925 ms | 299 ms |
 
-| Project | `cargo build` | `athrad build` |
-|---|---|---|
-| `shapes`, edit in the binary crate | 162 ms | 172 ms |
-| `shapes`, edit in the library | 221 ms | 214 ms |
-| `big.rs` as a package | 276 ms | 239 ms |
-| `popular`, edit in the binary | 423 ms | 295 ms |
+On a small crate, release is about as fast as `cargo build`, and on `add.rs` a little faster. Optimizing a few functions costs less than the debug rebuild's incremental bookkeeping. The cost shows up when the crate is large. `big.rs` is 1,800 lines and 7,373 functions, and release optimizes all of them on every edit: 1.7 s, about 10× `athrad watch`. `popular` reoptimizes one binary crate: 925 ms against 299 ms. `shapes` changes a small crate, so release stays near the debug rebuild.
 
-The one-file numbers sit within about 10 ms of the tables from before this work. `big.rs` is the one that grew, by about 10 ms. `add.rs` and `subset_flow.rs` are still the subset frontend. On a small Cargo project the two tools finish together. `popular` is where Athrad pulls ahead: 295 ms against 423 ms.
+The debug and Athrad columns sit within about 10 ms of the run from before release was added. `add.rs` and `subset_flow.rs` are still the subset frontend.
 
 Where a warm one-file edit goes, inside the process (`ATHRAD_TIME=1`, the edited function already in the code cache):
 

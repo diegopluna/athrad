@@ -6,6 +6,8 @@ For each program, the edit flips one literal inside `main` back and forth
 
   cargo build     a `cargo new` project with the program as src/main.rs,
                   debug profile, incremental, warmed up first
+  cargo release   the same project, `cargo build --release`: opt-level 3,
+                  and no incremental cache, which is what that command does
   athrad          the `athrad` command, one process per build, its caches
                   (rustc's incremental state with Athrad's objects, and
                   the per-function code cache) on disk, warmed up first
@@ -87,7 +89,10 @@ def save():
 def main():
     if not ATHRAD.exists():
         sys.exit("build athrad first: cargo build --release -p athrad")
-    print(f"{'program':15} {'cargo build':>12} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)", flush=True)
+    print(
+        f"{'program':15} {'cargo build':>12} {'release':>8} {'athrad':>8} {'athrad watch':>13}   (median of {RUNS}, ms)",
+        flush=True,
+    )
     for name, a, b in PROGRAMS:
         print(f"measuring {name}", file=sys.stderr, flush=True)
         src = ROOT / "oracle" / "programs" / name
@@ -98,6 +103,8 @@ def main():
             subprocess.run(["cargo", "new", "-q", "--vcs", "none", "--name", "prog", str(proj)], check=True)
             shutil.copy(src, proj / "src" / "main.rs")
             timed(["cargo", "build", "-q"], proj)
+            print(f"  {name} warming release", file=sys.stderr, flush=True)
+            timed(["cargo", "build", "-q", "--release"], proj)
             cargo_exe = proj / "target" / "debug" / "prog"
             # athrad's copy
             work = tmp / "athrad"
@@ -106,10 +113,12 @@ def main():
             athrad_exe = work / "prog"
             timed([ATHRAD, "main.rs", "-o", "prog"], work)
 
-            cargo_ms, athrad_ms, watch_ms = [], [], []
-            for _ in range(RUNS):
+            cargo_ms, release_ms, athrad_ms, watch_ms = [], [], [], []
+            for i in range(RUNS):
+                print(f"  {name} edit {i + 1}/{RUNS}", file=sys.stderr, flush=True)
                 flip(proj / "src" / "main.rs", a, b)
                 cargo_ms.append(timed(["cargo", "build", "-q"], proj))
+                release_ms.append(timed(["cargo", "build", "-q", "--release"], proj))
                 flip(work / "main.rs", a, b)
                 athrad_ms.append(timed([ATHRAD, "main.rs", "-o", "prog"], work))
                 if output(cargo_exe) != output(athrad_exe):
@@ -141,8 +150,13 @@ def main():
                 w.kill()
 
             med = lambda xs: statistics.median(xs)
-            print(f"{name:15} {med(cargo_ms):12.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}", flush=True)
-            RESULTS["programs"].append({"name": name, "cargo": cargo_ms, "athrad": athrad_ms, "watch": watch_ms})
+            print(
+                f"{name:15} {med(cargo_ms):12.0f} {med(release_ms):8.0f} {med(athrad_ms):8.0f} {med(watch_ms):13.0f}",
+                flush=True,
+            )
+            RESULTS["programs"].append(
+                {"name": name, "cargo": cargo_ms, "release": release_ms, "athrad": athrad_ms, "watch": watch_ms}
+            )
             save()
 
 
@@ -159,7 +173,10 @@ PROJECTS = [
 def projects():
     athrad = ATHRAD.with_name("athrad")
     print(flush=True)
-    print(f"{'project':18} {'cargo build':>12} {'athrad build':>13}   (median of {RUNS}, ms)", flush=True)
+    print(
+        f"{'project':18} {'cargo build':>12} {'release':>8} {'athrad build':>13}   (median of {RUNS}, ms)",
+        flush=True,
+    )
     for label, src, file, a, b in PROJECTS:
         print(f"measuring {label}", file=sys.stderr, flush=True)
         with tempfile.TemporaryDirectory() as tmp:
@@ -170,17 +187,27 @@ def projects():
                 subprocess.run(["cargo", "new", "-q", "--vcs", "none", "--name", "big", str(proj)], check=True)
                 shutil.copy(ROOT / "oracle" / "programs" / "big.rs", proj / "src" / "main.rs")
             timed(["cargo", "build", "-q"], proj)
+            print(f"  {label} warming release", file=sys.stderr, flush=True)
+            timed(["cargo", "build", "-q", "--release"], proj)
             timed([athrad, "build", "-q"], proj)
-            cargo_ms, athrad_ms = [], []
-            for _ in range(RUNS):
+            cargo_ms, release_ms, athrad_ms = [], [], []
+            for i in range(RUNS):
+                print(f"  {label} edit {i + 1}/{RUNS}", file=sys.stderr, flush=True)
                 flip(proj / file, a, b)
                 time.sleep(0.2)
                 cargo_ms.append(timed(["cargo", "build", "-q"], proj))
                 time.sleep(0.2)
+                release_ms.append(timed(["cargo", "build", "-q", "--release"], proj))
+                time.sleep(0.2)
                 athrad_ms.append(timed([athrad, "build", "-q"], proj))
             med = statistics.median
-            print(f"{label:18} {med(cargo_ms):12.0f} {med(athrad_ms):13.0f}", flush=True)
-            RESULTS["projects"].append({"name": label, "cargo": cargo_ms, "athrad": athrad_ms})
+            print(
+                f"{label:18} {med(cargo_ms):12.0f} {med(release_ms):8.0f} {med(athrad_ms):13.0f}",
+                flush=True,
+            )
+            RESULTS["projects"].append(
+                {"name": label, "cargo": cargo_ms, "release": release_ms, "athrad": athrad_ms}
+            )
             save()
 
 
